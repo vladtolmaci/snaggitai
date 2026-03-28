@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # ── Railway: set BOT_TOKEN, ANTHROPIC_KEY in Dashboard → Variables ───────────
-BOT_TOKEN      = "8581153858:AAHqr2I5VfKMcb1B4RTAYMkUYHeYh7yFpio"
+BOT_TOKEN      = "8632291921:AAEQayDGeceow0LqODRv2XnBCMu2SSYUmK8"
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_KEY", "")
 # On Railway /app/data is ephemeral — photos go there between sessions
 # PDF generation happens on local Mac via generate_from_supabase.py
