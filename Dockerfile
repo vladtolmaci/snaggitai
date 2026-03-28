@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Bot code
-COPY bot_railway_final.py ./bot.py
+COPY bot.py ./bot.py
 
 # Report generation
 COPY generate_v5_newtempl.py .
