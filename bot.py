@@ -35,7 +35,8 @@ ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
 # On Railway /app/data is ephemeral — photos go there between sessions
 # PDF generation happens on local Mac via generate_from_supabase.py
 REPORT_DIR     = os.environ.get("REPORT_DIR", "/app/data")
-GENERATOR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generate_v5_newtempl.py")
+ASSETS_DIR     = os.path.dirname(os.path.abspath(__file__))  # /app — where fonts/ tpl_v2/ live
+GENERATOR_PATH = os.path.join(ASSETS_DIR, "generate_v5_newtempl.py")
 for _d in [REPORT_DIR, os.path.join(REPORT_DIR, "photos"), os.path.join(REPORT_DIR, "backups")]:
     os.makedirs(_d, exist_ok=True)
 
@@ -944,8 +945,8 @@ def build_generator_script(report: dict, ai_texts: dict, output_pdf: str) -> str
 
     # Update output path and resource paths
     new_script = re.sub(r'OUT\s*=\s*"[^"]*"', f'OUT   = {json.dumps(output_pdf)}', new_script)
-    new_script = re.sub(r'TPL\s*=\s*"[^"]*"', f'TPL   = {json.dumps(REPORT_DIR + "/tpl_v2")}', new_script)
-    new_script = re.sub(r'FONTS\s*=\s*"[^"]*"', f'FONTS = {json.dumps(REPORT_DIR + "/fonts")}', new_script)
+    new_script = re.sub(r'TPL\s*=\s*"[^"]*"', f'TPL   = {json.dumps(ASSETS_DIR + "/tpl_v2")}', new_script)
+    new_script = re.sub(r'FONTS\s*=\s*"[^"]*"', f'FONTS = {json.dumps(ASSETS_DIR + "/fonts")}', new_script)
 
     return new_script
 
@@ -988,21 +989,28 @@ async def finish_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     photos_dir = os.path.join(REPORT_DIR, "photos")
     os.makedirs(photos_dir, exist_ok=True)
     downloaded = 0
+    skipped = 0
+    failed = 0
+    all_fids = [(z["name"], d.get("photo_file_id")) for z in report.get("zones",[]) for d in z.get("defects",[]) if d.get("photo_file_id")]
+    logger.info(f"Photos to download: {len(all_fids)}")
     for zone in report.get("zones", []):
         for d in zone.get("defects", []):
             fid = d.get("photo_file_id")
             if fid:
                 local_path = os.path.join(photos_dir, fid + ".jpg")
                 d["photo_path"] = local_path
-                if not os.path.exists(local_path):
+                if os.path.exists(local_path):
+                    skipped += 1
+                else:
                     try:
-                        bot_ref = context.bot
                         tg_file = await context.bot.get_file(fid)
                         await tg_file.download_to_drive(local_path)
                         downloaded += 1
                     except Exception as _pe:
-                        logger.warning(f"Photo download failed {fid[:20]}: {_pe}")
+                        logger.warning(f"Photo download failed {fid[:30]}: {_pe}")
                         d["photo_path"] = None
+                        failed += 1
+    logger.info(f"Photos: downloaded={downloaded} skipped={skipped} failed={failed}")
 
     await msg.reply_text(f"📸 {downloaded} photos downloaded. Building PDF...")
 
