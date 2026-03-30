@@ -1081,7 +1081,11 @@ async def finish_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 filename=os.path.basename(output_pdf),
                 caption=f"📄 Inspection Report\n{meta.get('project','')} — Unit {meta.get('unit','')}\n{meta.get('date','')}"
             )
-        delete_session(update.effective_user.id)
+        try:
+            if _SUPABASE:
+                _SUPABASE.table("bot_sessions").delete().eq("user_id", str(update.effective_user.id)).execute()
+        except Exception as _de:
+            logger.warning(f"Session delete failed: {_de}")
         await msg.reply_text("✅ Done! Type /start for a new report.")
 
     except Exception as e:
