@@ -996,8 +996,8 @@ async def finish_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 d["photo_path"] = local_path
                 if not os.path.exists(local_path):
                     try:
-                        bot_ref = msg.get_bot() if hasattr(msg, 'get_bot') else msg._bot
-                        tg_file = await bot_ref.get_file(fid)
+                        bot_ref = context.bot
+                        tg_file = await context.bot.get_file(fid)
                         await tg_file.download_to_drive(local_path)
                         downloaded += 1
                     except Exception as _pe:
