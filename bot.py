@@ -92,6 +92,15 @@ def get_report(context):
     return context.user_data["report"]
 
 
+def delete_session(user_id: int):
+    """Remove active session from Supabase after report is complete."""
+    if _SUPABASE:
+        try:
+            _SUPABASE.table("bot_sessions").delete().eq("user_id", str(user_id)).execute()
+        except Exception as e:
+            logger.warning(f"Session delete failed: {e}")
+
+
 def backup_to_disk(context, user_id: int):
     """Save full report JSON to disk after every defect. Never loses data."""
     try:
