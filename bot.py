@@ -1,4 +1,5 @@
 """
+Build: 2026-03-30 08:27
 Snaggit Inspection Bot v2
 - Collects full inspection data including inspector info
 - MEP zones via same flow with compliant-only defects
@@ -1025,7 +1026,9 @@ async def finish_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                         logger.warning(f"Photo download failed {fid[:30]}: {_pe}")
                         d["photo_path"] = None
                         failed += 1
-    logger.info(f"Photos: downloaded={downloaded} skipped={skipped} failed={failed}")
+    total_available = downloaded + skipped
+    logger.info(f"Photos: downloaded={downloaded} skipped(cached)={skipped} failed={failed} total={total_available}")
+    downloaded = total_available  # count cached photos too
 
     await msg.reply_text(f"📸 {downloaded} photos downloaded. Building PDF...")
 
