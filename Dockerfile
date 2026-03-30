@@ -1,6 +1,5 @@
 FROM python:3.12-slim
 
-# PDF generation deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     libglib2.0-0 \
@@ -13,18 +12,17 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Bot code
-COPY bot.py ./bot.py
-
-# Report generation
+COPY bot.py .
 COPY generate_v5_newtempl.py .
-
-# Templates and fonts — must be in these folders
 COPY tpl_v2/ ./tpl_v2/
-COPY fonts/  ./fonts/
+COPY fonts/ ./fonts/
 
-# Data dir for photos and temp files
+# Data dir for photos, pdfs, backups
 RUN mkdir -p /app/data/photos /app/data/backups
+
+# Symlink so both /app/data/fonts and /app/data/tpl_v2 point to real files
+RUN ln -s /app/fonts /app/data/fonts && \
+    ln -s /app/tpl_v2 /app/data/tpl_v2
 
 ENV REPORT_DIR=/app/data
 
