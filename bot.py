@@ -970,14 +970,21 @@ def build_generator_script(report: dict, ai_texts: dict, output_pdf: str) -> str
         "URGENT = " + json.dumps(ai_texts.get("urgent","").replace(chr(10)," ").replace(chr(13)," "), ensure_ascii=True) + n
     )
 
-    new_script = re.sub(
-        r'# [=\u2550]+[\r\n]+# REPORT DATA.*?(?=# [=\u2550]+[\r\n]+# BUILD PDF)',
-        data_section + "\n",
-        original, flags=re.DOTALL
-    )
-    if new_script == original:
-        import sys
-        print('WARNING: REPORT DATA section not found in generate script', file=sys.stderr)
+    # Try multiple patterns to handle different separator chars in generate script
+    patterns = [
+        r'# [=\u2550]+[\r\n]+# REPORT DATA[\s\S]*?(?=# [=\u2550]+[\r\n]+# BUILD PDF)',
+        r'# REPORT DATA[\s\S]*?(?=# BUILD PDF)',
+        r'DATA = \{[\s\S]*?URGENT = [^\n]+\n',
+    ]
+    new_script = original
+    for pat in patterns:
+        result = re.sub(pat, data_section + "\n", original, flags=re.DOTALL)
+        if result != original:
+            new_script = result
+            logger.info(f"REPORT DATA replaced using pattern: {pat[:40]}")
+            break
+    else:
+        logger.error("CRITICAL: Could not replace REPORT DATA section in generate script")
 
     # Update output path and resource paths
     new_script = re.sub(r'OUT\s*=\s*"[^"]*"', f'OUT   = {json.dumps(output_pdf)}', new_script)
