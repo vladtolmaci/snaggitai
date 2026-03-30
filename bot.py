@@ -28,6 +28,21 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def _startup_check():
+    import os
+    base = os.path.dirname(os.path.abspath(__file__))
+    checks = [
+        ('generate_v5_newtempl.py', os.path.join(base, 'generate_v5_newtempl.py')),
+        ('fonts/', os.path.join(base, 'fonts')),
+        ('tpl_v2/', os.path.join(base, 'tpl_v2')),
+        ('Lexend-Light.ttf', os.path.join(base, 'fonts', 'Lexend-Light.ttf')),
+        ('tpl_area.png', os.path.join(base, 'tpl_v2', 'tpl_area.png')),
+    ]
+    for name, path in checks:
+        exists = os.path.exists(path)
+        logging.getLogger(__name__).info(f"STARTUP CHECK: {name} -> {'OK' if exists else 'MISSING'} ({path})")
+_startup_check()
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # ── Railway: set BOT_TOKEN, ANTHROPIC_KEY in Dashboard → Variables ───────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
