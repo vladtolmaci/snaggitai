@@ -923,7 +923,11 @@ def build_generator_script(report: dict, ai_texts: dict, output_pdf: str) -> str
         original = f.read()
 
     # Clean AI texts FIRST — remove newlines that break Python string literals
-    def clean(t): return str(t).replace("\n", " ").replace("\r", " ").replace('"', '\"') if t else ""
+    def clean(t):
+        if not t: return ""
+        s = str(t).replace("\n", " ").replace("\r", " ")
+        # encode to ascii to eliminate any unicode that would break generated python script
+        return s.encode("ascii", "backslashreplace").decode("ascii").replace('"', '\\\"')
     ai_texts_clean = {}
     for k, v in ai_texts.items():
         if isinstance(v, str):
@@ -943,7 +947,7 @@ def build_generator_script(report: dict, ai_texts: dict, output_pdf: str) -> str
             obs_text = next((v for k, v in zone_obs_dict.items() if k.strip().lower() == zname_lower), None)
         if not obs_text:
             obs_text = f"Overall, the {z['name']} is in acceptable condition. No significant comments were noted during inspection."
-        defects = [{"sev": d.get("severity","minor"), "desc": d.get("description","").replace("\n"," ").replace("\r"," ").strip(), "photo": d.get("photo_path")} for d in z["defects"] if d.get("severity") != "compliant" or z.get("type") == "mep"]
+        defects = [{"sev": d.get("severity","minor"), "desc": d.get("description","").replace("\n"," ").replace("\r"," ").encode("ascii","replace").decode("ascii").strip(), "photo": d.get("photo_path")} for d in z["defects"] if d.get("severity") != "compliant" or z.get("type") == "mep"]
         areas_list.append({"num": str(z["zone_number"]), "name": z["name"], "defects": defects, "obs": obs_text})
 
     ai_texts = ai_texts_clean
@@ -967,10 +971,13 @@ def build_generator_script(report: dict, ai_texts: dict, output_pdf: str) -> str
     )
 
     new_script = re.sub(
-        r'# ═+\n# REPORT DATA.*?(?=# ═+\n# BUILD PDF)',
+        r'# [=\u2550]+[\r\n]+# REPORT DATA.*?(?=# [=\u2550]+[\r\n]+# BUILD PDF)',
         data_section + "\n",
         original, flags=re.DOTALL
     )
+    if new_script == original:
+        import sys
+        print('WARNING: REPORT DATA section not found in generate script', file=sys.stderr)
 
     # Update output path and resource paths
     new_script = re.sub(r'OUT\s*=\s*"[^"]*"', f'OUT   = {json.dumps(output_pdf)}', new_script)
