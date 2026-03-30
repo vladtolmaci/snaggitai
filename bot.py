@@ -89,6 +89,8 @@ def init_report(context):
     }
 
 def get_report(context):
+    if "report" not in context.user_data:
+        context.user_data["report"] = {"meta": {}, "zones": [], "_current_zone": None, "_current_defects": []}
     return context.user_data["report"]
 
 
@@ -908,15 +910,23 @@ def build_generator_script(report: dict, ai_texts: dict, output_pdf: str) -> str
     # compliant does NOT count toward total defects
     total = sev_counts["critical"] + sev_counts["medium"] + sev_counts["minor"]
 
+    def trunc(v, n=80): return str(v)[:n] if v else ""
     data_dict = {
-        "date": meta.get("date",""), "unit": meta.get("unit",""),
-        "project": meta.get("project",""), "type": meta.get("type",""),
-        "inspector": meta.get("inspector",""), "address": meta.get("address",""),
-        "client": meta.get("client",""), "reason": meta.get("reason",""),
-        "email": meta.get("email",""), "area": meta.get("area",""),
-        "furnished": meta.get("furnished",""), "floor": meta.get("floor",""),
-        "year": meta.get("year",""), "rooms": meta.get("rooms",""),
-        "developer": meta.get("developer",""),
+        "date": trunc(meta.get("date",""), 20),
+        "unit": trunc(meta.get("unit",""), 30),
+        "project": trunc(meta.get("project",""), 60),
+        "type": trunc(meta.get("type",""), 30),
+        "inspector": trunc(meta.get("inspector",""), 50),
+        "address": trunc(meta.get("address",""), 80),
+        "client": trunc(meta.get("client",""), 80),
+        "reason": trunc(meta.get("reason",""), 30),
+        "email": trunc(meta.get("email",""), 80),
+        "area": trunc(meta.get("area",""), 20),
+        "furnished": trunc(meta.get("furnished",""), 20),
+        "floor": trunc(meta.get("floor",""), 10),
+        "year": trunc(meta.get("year",""), 10),
+        "rooms": trunc(meta.get("rooms",""), 30),
+        "developer": trunc(meta.get("developer",""), 60),
     }
 
     with open(GENERATOR_PATH, "r") as f:
@@ -1022,7 +1032,7 @@ async def finish_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         ai_texts = {"zone_obs": {}, "summary_obs": "Inspection completed.", "general_condition": "The unit was inspected.", "urgent": "No critical items identified."}
 
     meta = report["meta"]
-    unit_safe = meta.get("unit","unknown").replace(" ","_")
+    unit_safe = meta.get("unit","unknown").replace(" ","_").replace("/","_").replace("\\","_").replace(":","_")
     date_safe = meta.get("date","unknown").replace(".","-")
     output_pdf = os.path.join(REPORT_DIR, f"Report_{unit_safe}_{date_safe}.pdf")
     tmp_script = os.path.join(REPORT_DIR, "_bot_generate_tmp.py")
