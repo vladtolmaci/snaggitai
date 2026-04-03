@@ -973,7 +973,8 @@ def build_generator_script(report: dict, ai_texts: dict, output_pdf: str) -> str
     ]
     new_script = original
     for pat in patterns:
-        result = re.sub(pat, data_section + "\n", original, flags=re.DOTALL)
+        # Use lambda to avoid re.sub interpreting \u in data_section as regex escapes
+        result = re.sub(pat, lambda m: data_section + "\n", original, flags=re.DOTALL)
         if result != original:
             new_script = result
             logger.info(f"REPORT DATA replaced using pattern: {pat[:40]}")
