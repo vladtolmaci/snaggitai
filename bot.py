@@ -159,7 +159,7 @@ def backup_to_disk(context, user_id: int):
             try:
                 _SUPABASE.table("bot_sessions").upsert({
                     "user_id": str(user_id),
-                    "data": json.dumps(snapshot, ensure_ascii=False, default=str),
+                    "data": snapshot,  # pass dict directly — supabase client handles jsonb serialization
                     "updated_at": datetime.utcnow().isoformat(),
                 }, on_conflict="user_id").execute()
                 _SUPABASE.table("report_backups").insert({
@@ -168,7 +168,7 @@ def backup_to_disk(context, user_id: int):
                     "project": meta.get("project", ""),
                     "inspector": meta.get("inspector", ""),
                     "date": meta.get("date", ""),
-                    "data": json.dumps(snapshot, ensure_ascii=False, default=str),
+                    "data": snapshot,  # pass dict directly — supabase client handles jsonb serialization
                 }).execute()
             except Exception as _se:
                 logger.warning(f"Supabase backup failed: {_se}")
@@ -501,21 +501,6 @@ async def analyse_photo_with_claude(photo_path: str, is_mep: bool = False) -> di
     raise last_err
 
 
-
-async def get_defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message.photo:
-        context.user_data["_temp_defect"] = {"photo_file_id": None, "photo_path": None}
-        await update.message.reply_text("🏷 <b>Severity</b> — select defect type:",
-            parse_mode="HTML", reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"))
-        return DEFECT_SEVERITY
-
-    photo = update.message.photo[-1]
-    photos_dir = f"{REPORT_DIR}/photos"
-    os.makedirs(photos_dir, exist_ok=True)
-    filename = f"{photos_dir}/{photo.file_id}.jpg"
-    file = await context.bot.get_file(photo.file_id)
-    await file.download_to_drive(filename)
-    context.user_data["_temp_defect"] = {"photo_file_id": photo.file_id, "photo_path": filename}
 
 async def get_defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message.photo:
@@ -1082,7 +1067,7 @@ async def finish_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 "user_id": str(update.effective_user.id),
                 "unit": meta.get("unit",""), "project": meta.get("project",""),
                 "inspector": meta.get("inspector",""), "date": meta.get("date",""),
-                "data": json.dumps(snap, ensure_ascii=False, default=str),
+                "data": snap,  # pass dict directly — supabase client handles jsonb serialization
             }).execute()
     except Exception as _se:
         logger.warning(f"Supabase save failed: {_se}")
