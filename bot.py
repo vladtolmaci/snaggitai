@@ -907,7 +907,15 @@ def build_generator_script(report: dict, ai_texts: dict, output_pdf: str) -> str
     # compliant does NOT count toward total defects
     total = sev_counts["critical"] + sev_counts["medium"] + sev_counts["minor"]
 
-    def trunc(v, n=80): return str(v)[:n] if v else ""
+    def trunc(v, n=80):
+        if not v: return ""
+        s = str(v)[:n]
+        # Replace common Unicode chars that appear in inspector input
+        s = s.replace("\u2014", " - ").replace("\u2013", " - ")
+        s = s.replace("\u2018", "'").replace("\u2019", "'")
+        s = s.replace("\u201c", '"').replace("\u201d", '"')
+        s = s.replace("\u2026", "...")
+        return s.encode("ascii", "replace").decode("ascii")
     data_dict = {
         "date": trunc(meta.get("date",""), 20),
         "unit": trunc(meta.get("unit",""), 30),
