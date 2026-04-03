@@ -72,7 +72,8 @@ for _d in [REPORT_DIR, os.path.join(REPORT_DIR, "photos"), os.path.join(REPORT_D
     AI_CONFIRM,          # V2: AI photo analysis confirmation
     GO_BACK_ZONE,        # rollup zone picker for missed defects
     DELETE_DEFECT,       # pick defect to delete from zone
-) = range(24)
+    DELETE_ZONE_PICK,    # pick which zone to delete from
+) = range(25)
 
 PROPERTY_TYPES    = ["Apartment", "Villa", "Townhouse", "Penthouse", "Studio", "Duplex"]
 FURNISHED_OPTIONS = ["Furnished", "Not Furnished", "Semi-Furnished"]
@@ -189,6 +190,68 @@ def pb(step):
     return "█" * filled + "░" * (10 - filled) + f"  {step}/{TOTAL_META_STEPS}"
 
 
+# ── META CHAIN — for /back navigation ────────────────────────────────────────
+# Each tuple: (state, meta_key, step_number, prompt_text, reply_kb_options)
+META_CHAIN = [
+    (DATE,          "date",      1,  "📅 <b>Date of Inspection</b>\nEnter date (e.g. 19.03.2026):", None),
+    (PROJECT_NAME,  "project",   2,  "🏗 <b>Project Name</b>", None),
+    (UNIT_NUMBER,   "unit",      3,  "🔢 <b>Unit Number</b>", None),
+    (PROPERTY_TYPE, "type",      4,  "🏠 <b>Property Type</b>", PROPERTY_TYPES),
+    (CLIENT_NAME,   "client",    5,  "👤 <b>Client Name</b>", None),
+    (CLIENT_EMAIL,  "email",     6,  "📧 <b>Client Email</b>", None),
+    (REASON,        "reason",    7,  "📋 <b>Reason for Inspection</b>", None),
+    (INSPECTOR,     "inspector", 8,  "🧑‍🔧 <b>Inspector Name</b>", None),
+    (ADDRESS,       "address",   9,  "📍 <b>Property Address</b>\n(e.g. Sobha Hartland, MBR City, Dubai)", None),
+    (DEVELOPER,     "developer", 10, "🏢 <b>Developer</b>\n(e.g. Emaar, Sobha, Damac)", None),
+    (TOTAL_AREA,    "area",      11, "📐 <b>Total Area</b>\n(e.g. 1200 sq ft)", None),
+    (FLOOR_NUMBER,  "floor",     12, "🏢 <b>Floor Number</b>", None),
+    (NUM_ROOMS,     "rooms",     13, "🛏 <b>Number of Rooms</b>\n(e.g. 1 Bedroom)", None),
+    (FURNISHED,     "furnished", 14, "🛋 <b>Furnished?</b>", FURNISHED_OPTIONS),
+    (YEAR_BUILT,    "year",      15, "📅 <b>Year Built</b>", None),
+]
+# Index by state for quick lookup
+_META_BY_STATE = {state: i for i, (state, *_) in enumerate(META_CHAIN)}
+
+
+async def back_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/back — go to the previous meta step, or back to AFTER_DEFECT from zone/photo states."""
+    # Figure out which state we're in by checking what the bot is waiting for
+    # We store the current state in user_data
+    current = context.user_data.get("_current_state")
+
+    if current is not None and current in _META_BY_STATE:
+        idx = _META_BY_STATE[current]
+        if idx == 0:
+            await update.message.reply_text("⚠️ This is the first step. Type /cancel to restart.", parse_mode="HTML")
+            return current
+
+        # Go back one step
+        prev_state, prev_key, prev_step, prev_prompt, prev_kb = META_CHAIN[idx - 1]
+        # Show current value if exists
+        meta = get_report(context).get("meta", {})
+        old_val = meta.get(prev_key, "")
+        hint = f"\n\n<i>Current: {old_val}</i>" if old_val else ""
+
+        markup = reply_kb(prev_kb) if prev_kb else ReplyKeyboardRemove()
+        await update.message.reply_text(
+            f"↩️ Going back...\n\n<code>{pb(prev_step)}</code>\n\n{prev_prompt}{hint}",
+            parse_mode="HTML", reply_markup=markup
+        )
+        context.user_data["_current_state"] = prev_state
+        return prev_state
+
+    # If in zone/photo/defect flow — just tell them to use the menu
+    if current in (ZONE_TYPE, ZONE_NAME, DEFECT_PHOTO, DEFECT_SEVERITY, DEFECT_DESC, AI_CONFIRM):
+        await update.message.reply_text(
+            "↩️ Can't go back here — use the menu buttons or /cancel to restart.",
+            parse_mode="HTML"
+        )
+        return current if current is not None else DEFECT_PHOTO
+
+    await update.message.reply_text("↩️ /back is available during property info steps.", parse_mode="HTML")
+    return current if current is not None else DEFECT_PHOTO
+
+
 # ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     init_report(context)
@@ -198,6 +261,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     await update.message.reply_text(
         f"<code>{pb(1)}</code>\n\n📅 <b>Date of Inspection</b>\nEnter date (e.g. 19.03.2026):", parse_mode="HTML")
+    context.user_data["_current_state"] = DATE
     return DATE
 
 
@@ -205,76 +269,90 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["date"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(2)}</code>\n\n🏗 <b>Project Name</b>", parse_mode="HTML")
+    context.user_data["_current_state"] = PROJECT_NAME
     return PROJECT_NAME
 
 async def get_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["project"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(3)}</code>\n\n🔢 <b>Unit Number</b>", parse_mode="HTML")
+    context.user_data["_current_state"] = UNIT_NUMBER
     return UNIT_NUMBER
 
 async def get_unit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["unit"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(4)}</code>\n\n🏠 <b>Property Type</b>",
         parse_mode="HTML", reply_markup=reply_kb(PROPERTY_TYPES))
+    context.user_data["_current_state"] = PROPERTY_TYPE
     return PROPERTY_TYPE
 
 async def get_property_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["type"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(5)}</code>\n\n👤 <b>Client Name</b>",
         parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    context.user_data["_current_state"] = CLIENT_NAME
     return CLIENT_NAME
 
 async def get_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["client"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(6)}</code>\n\n📧 <b>Client Email</b>", parse_mode="HTML")
+    context.user_data["_current_state"] = CLIENT_EMAIL
     return CLIENT_EMAIL
 
 async def get_client_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["email"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(7)}</code>\n\n📋 <b>Reason for Inspection</b>", parse_mode="HTML")
+    context.user_data["_current_state"] = REASON
     return REASON
 
 async def get_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["reason"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(8)}</code>\n\n🧑‍🔧 <b>Inspector Name</b>", parse_mode="HTML")
+    context.user_data["_current_state"] = INSPECTOR
     return INSPECTOR
 
 async def get_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["inspector"] = update.message.text.strip()
     await update.message.reply_text(
         f"<code>{pb(9)}</code>\n\n📍 <b>Property Address</b>\n(e.g. Sobha Hartland, MBR City, Dubai)", parse_mode="HTML")
+    context.user_data["_current_state"] = ADDRESS
     return ADDRESS
 
 async def get_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["address"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(10)}</code>\n\n🏢 <b>Developer</b>\n(e.g. Emaar, Sobha, Damac)", parse_mode="HTML")
+    context.user_data["_current_state"] = DEVELOPER
     return DEVELOPER
 
 async def get_developer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["developer"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(11)}</code>\n\n📐 <b>Total Area</b>\n(e.g. 1200 sq ft)", parse_mode="HTML")
+    context.user_data["_current_state"] = TOTAL_AREA
     return TOTAL_AREA
 
 async def get_area(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["area"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(12)}</code>\n\n🏢 <b>Floor Number</b>", parse_mode="HTML")
+    context.user_data["_current_state"] = FLOOR_NUMBER
     return FLOOR_NUMBER
 
 async def get_floor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["floor"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(13)}</code>\n\n🛏 <b>Number of Rooms</b>\n(e.g. 1 Bedroom)", parse_mode="HTML")
+    context.user_data["_current_state"] = NUM_ROOMS
     return NUM_ROOMS
 
 async def get_rooms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["rooms"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(14)}</code>\n\n🛋 <b>Furnished?</b>",
         parse_mode="HTML", reply_markup=reply_kb(FURNISHED_OPTIONS))
+    context.user_data["_current_state"] = FURNISHED
     return FURNISHED
 
 async def get_furnished(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     get_report(context)["meta"]["furnished"] = update.message.text.strip()
     await update.message.reply_text(f"<code>{pb(15)}</code>\n\n📅 <b>Year Built</b>",
         parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    context.user_data["_current_state"] = YEAR_BUILT
     return YEAR_BUILT
 
 async def get_year(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -294,6 +372,7 @@ async def get_year(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ])
     )
     get_report(context)["_zone_count"] = 1
+    context.user_data["_current_state"] = ZONE_TYPE
     return ZONE_TYPE
 
 
@@ -738,6 +817,9 @@ async def after_defect_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["_temp_defect"] = {}
         await query.message.reply_text("📸 Send a photo of the next defect (or /skip_photo):", parse_mode="HTML")
         return DEFECT_PHOTO
+
+    if action == "delete":
+        return await cmd_delete(update, context)
 
     if action == "missed":
         # Show rollup of saved zones — remember current zone to return to
@@ -1294,29 +1376,96 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     backup_to_disk(context, user_id)
 
 
-# ── /delete — remove a defect from current zone ──────────────────────────────
+# ── /delete — remove a defect from ANY zone ──────────────────────────────────
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show list of defects in current zone with delete buttons."""
+    """Show all zones (completed + current) — user picks which zone to delete from."""
     report = get_report(context)
-    defects = report.get("_current_defects", [])
 
-    if not defects:
-        await update.message.reply_text("No defects in current zone to delete.")
+    # Build combined list: completed zones + current open zone
+    all_zones = list(report.get("zones", []))
+    current_zone = report.get("_current_zone")
+    if current_zone:
+        cur_copy = dict(current_zone)
+        cur_copy["defects"] = list(report.get("_current_defects", []))
+        cur_copy["_is_current"] = True
+        all_zones.append(cur_copy)
+
+    if not all_zones:
+        msg = update.message or (update.callback_query.message if update.callback_query else None)
+        if msg:
+            await msg.reply_text("⚠️ No zones or defects to delete from.")
         return DEFECT_PHOTO
 
     buttons = []
-    for d in defects:
+    for z in sorted(all_zones, key=lambda x: x.get("zone_number", 0)):
+        defect_count = len(z.get("defects", []))
+        if defect_count == 0:
+            continue
+        is_cur = z.get("_is_current", False)
+        label = f"{'📍 ' if is_cur else ''}{z.get('zone_number', '?')}. {z.get('name', '?')} ({defect_count} defects)"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"delzone:{z.get('zone_number', 0)}")])
+
+    if not buttons:
+        msg = update.message or (update.callback_query.message if update.callback_query else None)
+        if msg:
+            await msg.reply_text("⚠️ No defects to delete.")
+        return DEFECT_PHOTO
+
+    buttons.append([InlineKeyboardButton("↩️ Cancel", callback_data="delzone:cancel")])
+
+    msg = update.message or (update.callback_query.message if update.callback_query else None)
+    await msg.reply_text(
+        "🗑 <b>Delete defect — pick zone:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return DELETE_ZONE_PICK
+
+
+async def handle_delete_zone_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User picked a zone — now show defects to delete."""
+    query = update.callback_query
+    await query.answer()
+    val = query.data.split(":")[1]
+
+    if val == "cancel":
+        await query.message.reply_text("Cancelled. Continue inspection.")
+        return DEFECT_PHOTO
+
+    zone_num = int(val)
+    report = get_report(context)
+    context.user_data["_delete_from_zone"] = zone_num
+
+    # Find the zone — could be in completed zones or current
+    current_zone = report.get("_current_zone")
+    target = None
+    is_current = False
+
+    if current_zone and current_zone.get("zone_number") == zone_num:
+        target = current_zone
+        target_defects = report.get("_current_defects", [])
+        is_current = True
+    else:
+        target = next((z for z in report.get("zones", []) if z.get("zone_number") == zone_num), None)
+        target_defects = target.get("defects", []) if target else []
+
+    if not target or not target_defects:
+        await query.message.reply_text("⚠️ Zone not found or no defects.")
+        return DEFECT_PHOTO
+
+    buttons = []
+    for d in target_defects:
         sev = d.get("severity", "")
-        desc = d.get("description", "(no desc)")
+        desc = d.get("description", "(no desc)")[:40]
         num = d.get("defect_number", "?")
         buttons.append([InlineKeyboardButton(
-            f"{SEV_EMOJI.get(sev,'')} #{num} {desc}  🗑",
+            f"{SEV_EMOJI.get(sev, '')} #{num} {desc}  🗑",
             callback_data=f"del:{num}"
         )])
-    buttons.append([InlineKeyboardButton("↩️ Cancel", callback_data="del:cancel")])
+    buttons.append([InlineKeyboardButton("↩️ Back to zones", callback_data="del:back")])
 
-    await update.message.reply_text(
-        "🗑 <b>Select defect to delete:</b>",
+    await query.message.reply_text(
+        f"🗑 <b>{target['name']}</b> — select defect to delete:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -1324,43 +1473,67 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle defect deletion."""
+    """Handle defect deletion from any zone."""
     query = update.callback_query
     await query.answer()
     val = query.data.split(":")[1]
 
     if val == "cancel":
-        await query.message.reply_text("Cancelled. Continue inspection:")
+        await query.message.reply_text("Cancelled. Continue inspection.")
         return DEFECT_PHOTO
+
+    if val == "back":
+        # Go back to zone picker
+        return await cmd_delete(update, context)
 
     num = int(val)
     report = get_report(context)
-    defects = report.get("_current_defects", [])
-    target = next((d for d in defects if d.get("defect_number") == num), None)
+    zone_num = context.user_data.get("_delete_from_zone")
 
+    # Find the right zone and its defects list
+    current_zone = report.get("_current_zone")
+    if current_zone and current_zone.get("zone_number") == zone_num:
+        defects = report.get("_current_defects", [])
+        is_current = True
+    else:
+        target_zone = next((z for z in report.get("zones", []) if z.get("zone_number") == zone_num), None)
+        if not target_zone:
+            await query.message.reply_text("⚠️ Zone not found.")
+            return DEFECT_PHOTO
+        defects = target_zone.get("defects", [])
+        is_current = False
+
+    target = next((d for d in defects if d.get("defect_number") == num), None)
     if not target:
-        await query.message.reply_text("Defect not found.")
+        await query.message.reply_text("⚠️ Defect not found.")
         return DEFECT_PHOTO
 
-    report["_current_defects"] = [d for d in defects if d.get("defect_number") != num]
+    # Remove the defect
+    new_defects = [d for d in defects if d.get("defect_number") != num]
     # Renumber remaining
-    for i, d in enumerate(report["_current_defects"], 1):
+    for i, d in enumerate(new_defects, 1):
         d["defect_number"] = i
+
+    if is_current:
+        report["_current_defects"] = new_defects
+    else:
+        target_zone = next(z for z in report["zones"] if z["zone_number"] == zone_num)
+        target_zone["defects"] = new_defects
 
     backup_to_disk(context, update.effective_user.id)
 
     sev_del = target.get("severity", "")
     desc_del = target.get("description", "")
-    rem = len(report["_current_defects"])
+    rem = len(new_defects)
     await query.message.reply_text(
-        f"\U0001f5d1 Deleted: {SEV_EMOJI.get(sev_del, '')} {desc_del}\n\n"
+        f"\U0001f5d1 Deleted: {SEV_EMOJI.get(sev_del, '')} {desc_del}\n"
         f"Remaining: {rem} defects in this zone.\n\nContinue:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add another defect", callback_data="action:add_defect")],
-            [InlineKeyboardButton("📍 New zone",            callback_data="action:new_zone")],
-            [InlineKeyboardButton("🔍 Missed a defect",    callback_data="action:missed")],
-            [InlineKeyboardButton("✅ Finish report",       callback_data="action:finish")],
+            [InlineKeyboardButton("🗑 Delete another", callback_data="action:delete")],
+            [InlineKeyboardButton("➕ Add defect", callback_data="action:add_defect")],
+            [InlineKeyboardButton("📍 New zone", callback_data="action:new_zone")],
+            [InlineKeyboardButton("✅ Finish report", callback_data="action:finish")],
         ])
     )
     return AFTER_DEFECT
@@ -1392,23 +1565,23 @@ def build_app():
         entry_points=[CommandHandler("start", start)],
         per_message=False,
         states={
-            DATE:            [MessageHandler(filters.TEXT & ~filters.COMMAND, get_date)],
-            PROJECT_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_project)],
-            UNIT_NUMBER:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_unit)],
-            PROPERTY_TYPE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_property_type)],
-            CLIENT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_client_name)],
-            CLIENT_EMAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_client_email)],
-            REASON:          [MessageHandler(filters.TEXT & ~filters.COMMAND, get_reason)],
-            INSPECTOR:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_inspector)],
-            ADDRESS:         [MessageHandler(filters.TEXT & ~filters.COMMAND, get_address)],
-            DEVELOPER:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_developer)],
-            TOTAL_AREA:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_area)],
-            FLOOR_NUMBER:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_floor)],
-            NUM_ROOMS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_rooms)],
-            FURNISHED:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_furnished)],
-            YEAR_BUILT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_year)],
+            DATE:            [MessageHandler(filters.TEXT & ~filters.COMMAND, get_date), CommandHandler("back", back_step)],
+            PROJECT_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_project), CommandHandler("back", back_step)],
+            UNIT_NUMBER:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_unit), CommandHandler("back", back_step)],
+            PROPERTY_TYPE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_property_type), CommandHandler("back", back_step)],
+            CLIENT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_client_name), CommandHandler("back", back_step)],
+            CLIENT_EMAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_client_email), CommandHandler("back", back_step)],
+            REASON:          [MessageHandler(filters.TEXT & ~filters.COMMAND, get_reason), CommandHandler("back", back_step)],
+            INSPECTOR:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_inspector), CommandHandler("back", back_step)],
+            ADDRESS:         [MessageHandler(filters.TEXT & ~filters.COMMAND, get_address), CommandHandler("back", back_step)],
+            DEVELOPER:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_developer), CommandHandler("back", back_step)],
+            TOTAL_AREA:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_area), CommandHandler("back", back_step)],
+            FLOOR_NUMBER:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_floor), CommandHandler("back", back_step)],
+            NUM_ROOMS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_rooms), CommandHandler("back", back_step)],
+            FURNISHED:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_furnished), CommandHandler("back", back_step)],
+            YEAR_BUILT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_year), CommandHandler("back", back_step)],
             ZONE_TYPE:       [CallbackQueryHandler(get_zone_type, pattern="^zonetype:")],
-            ZONE_NAME:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_zone_name)],
+            ZONE_NAME:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_zone_name), CommandHandler("back", back_step)],
             DEFECT_PHOTO: [
                 MessageHandler(filters.PHOTO, get_defect_photo),
                 CommandHandler("skip_photo", skip_photo),
@@ -1427,9 +1600,10 @@ def build_app():
                                CommandHandler("backup", cmd_backup),
                                CommandHandler("delete", cmd_delete)],
             GO_BACK_ZONE:    [CallbackQueryHandler(handle_go_back, pattern="^goback:")],
+            DELETE_ZONE_PICK:[CallbackQueryHandler(handle_delete_zone_pick, pattern="^delzone:")],
             DELETE_DEFECT:   [CallbackQueryHandler(handle_delete, pattern="^del:")],
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("missed", cmd_missed), CommandHandler("backup", cmd_backup), CommandHandler("delete", cmd_delete)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("missed", cmd_missed), CommandHandler("backup", cmd_backup), CommandHandler("delete", cmd_delete), CommandHandler("back", back_step)],
         allow_reentry=True,
     )
     app.add_handler(conv)
