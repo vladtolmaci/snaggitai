@@ -515,6 +515,18 @@ async def get_defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     filename = f"{photos_dir}/{photo.file_id}.jpg"
     file = await context.bot.get_file(photo.file_id)
     await file.download_to_drive(filename)
+
+    # Upload to Supabase Storage — photos persist there permanently
+    if _SUPABASE:
+        try:
+            with open(filename, "rb") as f_img:
+                _SUPABASE.storage.from_("inspection-photos").upload(
+                    f"{photo.file_id}.jpg", f_img.read(),
+                    file_options={"content-type": "image/jpeg", "upsert": "true"}
+                )
+        except Exception as _upe:
+            logger.warning(f"Photo upload to Supabase Storage failed: {_upe}")
+
     context.user_data["_temp_defect"] = {"photo_file_id": photo.file_id, "photo_path": filename}
 
     # Detect if current zone is MEP
@@ -921,8 +933,16 @@ def build_generator_script(report: dict, ai_texts: dict, output_pdf: str) -> str
     def clean(t):
         if not t: return ""
         s = str(t).replace("\n", " ").replace("\r", " ")
-        # encode to ascii to eliminate any unicode that would break generated python script
-        return s.encode("ascii", "backslashreplace").decode("ascii").replace('"', '\\\"')
+        # Replace common Unicode chars with ASCII equivalents
+        s = s.replace("\u2014", " - ")   # em dash
+        s = s.replace("\u2013", " - ")   # en dash
+        s = s.replace("\u2018", "'")     # left single quote
+        s = s.replace("\u2019", "'")     # right single quote
+        s = s.replace("\u201c", '"')     # left double quote
+        s = s.replace("\u201d", '"')     # right double quote
+        s = s.replace("\u2026", "...")   # ellipsis
+        # Drop any remaining non-ASCII safely, escape double quotes for Python string
+        return s.encode("ascii", "replace").decode("ascii").replace('"', '\\\"')
     ai_texts_clean = {}
     for k, v in ai_texts.items():
         if isinstance(v, str):
