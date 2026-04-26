@@ -79,7 +79,7 @@ except ImportError:
 # ── Constants ────────────────────────────────────────────────────────────────
 PROPERTY_TYPES = ["Apartment", "Villa", "Townhouse", "Penthouse", "Duplex", "Studio", "Office"]
 FURNISHED_OPTIONS = ["Furnished", "Unfurnished", "Semi-furnished"]
-SEVERITY_OPTIONS = ["minor", "medium", "critical"]
+SEVERITY_OPTIONS = ["compliant", "minor", "medium", "critical"]
 
 MEP_CHECKLISTS = {
     "electrical": [
@@ -262,21 +262,25 @@ async def generate_ai_texts(meta: dict, zones: list) -> dict:
     """
     # Build per-zone defect listings for the prompt
     zone_blocks = []
-    all_defects_flat = []
+    real_defects_count = 0  # excludes compliant
+    compliant_count = 0
     for z in zones:
         z_defects = []
         for d in (z.get("defects") or []):
             sev = d.get("severity", "?")
             desc = d.get("description", "?")
             z_defects.append(f"  - {desc} ({sev})")
-            all_defects_flat.append(f"{z['name']}: {desc} ({sev})")
+            if sev == "compliant":
+                compliant_count += 1
+            else:
+                real_defects_count += 1
         is_mep = (z.get("type") == "mep")
         header = f"Zone #{z['zone_number']}: {z['name']}" + (" [MEP]" if is_mep else "")
         body = "\n".join(z_defects) if z_defects else "  (no defects recorded)"
         zone_blocks.append(f"{header}\n{body}")
 
     zones_text = "\n\n".join(zone_blocks) if zone_blocks else "No zones inspected."
-    total = len(all_defects_flat)
+    total_zones = len(zones)
     unit = meta.get("unit", "?")
     project = meta.get("project", "?")
     reason = meta.get("reason", "handover")
@@ -291,25 +295,30 @@ async def generate_ai_texts(meta: dict, zones: list) -> dict:
     Project: {project}
     Unit: {unit}
     Reason: {reason}
-    Total defects across the whole unit: {total}
+    Total zones inspected: {total_zones}
+    Total defects (excluding compliant): {real_defects_count}
+    Compliant items (passed checks or positive observations, NOT defects): {compliant_count}
 
-    Zones and their recorded defects:
+    Zones and their recorded items:
     {zones_text}
 
-    Write professional, neutral English. No markdown, no bullets, plain text only. Do not invent defects — only describe what is listed.
+    Write professional, neutral English. No markdown, no bullets, plain text only. Do not invent defects, only describe what is listed.
+
+    CRITICAL: When you mention "defects" or "comments" in any text, use the number {real_defects_count}, NOT {real_defects_count + compliant_count}. Compliant items are passed checks or positive observations — they are NOT defects, regardless of whether they're in a regular or MEP zone.
 
     Return ONLY raw JSON with this exact shape (no code fences):
     {{
-      "summary_obs": "2-3 sentences for the Summary page. Overview of unit condition and total comments found.",
-      "general_condition": "2-3 sentences for the Conclusions page. Property condition, number of zones inspected, key areas of concern.",
-      "urgent": "1-2 sentences listing the most critical/medium items that need immediate attention. If none, say 'No critical items identified.'",
+      "summary_obs": "MAX 380 CHARACTERS. 2-3 short sentences for the Summary page. Overview of unit condition. Use defect count {real_defects_count}. Be concise as long text gets truncated.",
+      "general_condition": "MAX 600 CHARACTERS. 2-3 sentences for the Conclusions page. Property condition, number of zones inspected, key areas of concern.",
+      "urgent": "MAX 350 CHARACTERS. 1-2 short sentences listing the most critical/medium items that need immediate attention. If none, say 'No critical items identified.'",
       "zone_obs": {{ {zone_obs_json_schema} }}
     }}
 
     Rules for "zone_obs":
     - One entry per zone_number (keys must be strings matching exactly the zone numbers above).
-    - Each value: 2-3 sentences, max ~400 characters. Mention defect count and key items. For zones with no defects, write a positive compliant statement (e.g. "Overall, the <Zone> is in good condition. No comments were noted during inspection.").
-    - For MEP zones, phrase around systems tested (e.g. "All <system> items tested and found compliant." or "The <system> system has N issues noted requiring attention.").
+    - Each value: 2-3 sentences, MAX 400 characters. Use real defect count for that zone (do NOT count compliant items as defects). For zones with no defects, write a positive statement (e.g. "Overall, the <Zone> is in good condition. No comments were noted during inspection.").
+    - For ANY zone (regular or MEP), distinguish compliant items from real defects. Compliant items can appear in any zone. Example: "The Living Room has 2 defects identified, while 1 item was confirmed compliant." NOT "3 comments noted" if 1 is compliant.
+    - For MEP zones specifically, phrase around systems tested. Example: "All electrical sockets were tested. 2 issues require attention."
     """)
 
     try:
@@ -843,27 +852,21 @@ async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     # Store photo file_id (we no longer need bytes in memory — AI vision was removed)
     context.user_data["_temp_photo_file_id"] = photo.file_id
 
-    is_mep = context.user_data.get("_is_mep", False)
-    options = ["compliant", "minor", "medium", "critical"] if is_mep else SEVERITY_OPTIONS
-
     await update.message.reply_text(
         "📸 Photo received.\n\n<b>Select severity:</b>",
         parse_mode="HTML",
-        reply_markup=inline_kb(options, "sev"),
+        reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
     )
     return DEFECT_SEVERITY
 
 
 async def skip_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """No photo available — go to manual severity anyway (no MEP auto-compliant shortcut in v4)."""
+    """No photo available — go to manual severity anyway."""
     context.user_data["_temp_photo_file_id"] = None
-
-    is_mep = context.user_data.get("_is_mep", False)
-    options = ["compliant", "minor", "medium", "critical"] if is_mep else SEVERITY_OPTIONS
 
     await update.message.reply_text(
         "Select severity:",
-        reply_markup=inline_kb(options, "sev"),
+        reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
     )
     return DEFECT_SEVERITY
 
@@ -875,15 +878,22 @@ async def defect_severity(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     severity = query.data.split(":", 1)[1]
     context.user_data["_manual_severity"] = severity
 
-    # For MEP 'compliant' we still need a short description, but offer a default button to skip typing.
+    # For 'compliant' we still need a short description; offer default buttons to skip typing.
     if severity == "compliant":
+        is_mep = context.user_data.get("_is_mep", False)
+        default_buttons = [
+            [InlineKeyboardButton("✅ Functional and compliant", callback_data="usedesc:Functional and compliant")],
+        ]
+        if not is_mep:
+            # Regular zones get an additional, more general default
+            default_buttons.append(
+                [InlineKeyboardButton("✅ In good condition, no issues", callback_data="usedesc:In good condition, no issues")]
+            )
         await query.edit_message_text(
             "Severity: <b>🟢 compliant</b>\n\n"
-            "Type a short note, or tap the button to use the default:",
+            "Type a short note, or tap a button to use a default:",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Use: Functional and compliant", callback_data="usedesc:Functional and compliant")],
-            ]),
+            reply_markup=InlineKeyboardMarkup(default_buttons),
         )
         return DEFECT_DESC
 
@@ -1401,7 +1411,7 @@ async def _build_pdf(meta: dict, zones: list, sev_counts: dict, total: int, ai_t
             mep_defects_count = 0
             for d in (z.get("defects") or []):
                 sev = d.get("severity", "compliant")
-                desc = trunc(d.get("description", ""), 80)
+                desc = trunc(d.get("description", ""), 100)
                 checks.append({
                     "sev": sev,
                     "desc": desc,
@@ -1425,24 +1435,28 @@ async def _build_pdf(meta: dict, zones: list, sev_counts: dict, total: int, ai_t
                 "obs": trunc(obs, 450),
             })
         else:
-            # Regular zones: only include actual defects (not compliant)
+            # Regular zones: include ALL items (compliant and defects).
+            # v4: compliant comments are now allowed in regular zones too — inspector may want
+            # to flag a positive observation. They render as green COMPLIANT cards.
             defects = []
+            real_defects_count = 0
             for d in (z.get("defects") or []):
-                if d.get("severity") == "compliant":
-                    continue
+                sev = d.get("severity", "minor")
                 defects.append({
-                    "sev": d.get("severity", "minor"),
-                    "desc": trunc(d.get("description", ""), 80),
+                    "sev": sev,
+                    "desc": trunc(d.get("description", ""), 100),
                     "photo": d.get("photo_path", ""),
                 })
+                if sev != "compliant":
+                    real_defects_count += 1
 
-            n = len(defects)
             # Prefer AI-generated obs; fall back to hardcoded template
             if zone_obs_map.get(zn_key):
                 obs = zone_obs_map[zn_key]
-            elif n > 0:
-                items = ", ".join(d["desc"] for d in defects[:5])
-                obs = f"The {z['name']} area has {n} comments noted. Comments include {items}. Mentioned comments should be rectified prior to handover."
+            elif real_defects_count > 0:
+                defect_items = [d["desc"] for d in defects if d["sev"] != "compliant"]
+                items = ", ".join(defect_items[:5])
+                obs = f"The {z['name']} area has {real_defects_count} comments noted. Comments include {items}. Mentioned comments should be rectified prior to handover."
             else:
                 obs = f"Overall, the {z['name']} is in good condition. No comments were noted during inspection."
 
@@ -1465,9 +1479,9 @@ async def _build_pdf(meta: dict, zones: list, sev_counts: dict, total: int, ai_t
     urgent = ai_texts.get("urgent") or "No critical items identified."
 
     # Clean texts
-    summary_obs = trunc(summary_obs, 500)
-    general_cond = trunc(general_cond, 500)
-    urgent = trunc(urgent, 500)
+    summary_obs = trunc(summary_obs, 432)   # 12 lines × 36 chars in PDF render
+    general_cond = trunc(general_cond, 600)
+    urgent = trunc(urgent, 350)
 
     def to_py(obj):
         """Convert Python object to Python literal string, ASCII-safe."""
