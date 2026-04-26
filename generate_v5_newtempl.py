@@ -206,7 +206,8 @@ def draw_summary(c, totals, summary_obs):
     # Right block observations text — x=343, y_pdf=134, line_h=13pt, font 12pt Regular
     c.setFont("Lex-Regular", 12)
     c.setFillColor(DARK)
-    for i, ln in enumerate(textwrap.wrap(summary_obs, 36)[:7]):
+    # v4: increased from 7 to 12 lines so 380-char summary_obs fits without mid-sentence truncation
+    for i, ln in enumerate(textwrap.wrap(summary_obs, 36)[:12]):
         c.drawString(343, F(134, 12) - i * 13, ln)
 
     # Colored boxes (Critical/Medium/Minor) — static in template, do NOT touch
@@ -326,7 +327,7 @@ def defect_card(c, fx, fy, sev, desc, photo=None):
     # Actually: baseline y_rl = card_rl + (CAPTION_H - 9) / 2 + 2  (vertically centered)
     c.setFont("Lex-SemiBold", 9)
     c.setFillColor(DARK)
-    lines = textwrap.wrap(desc, 24)[:3]
+    lines = textwrap.wrap(desc, 28)[:4]
     line_h = 11
     total_h = len(lines) * line_h
     start_y = card_rl + (CAPTION_H + total_h) / 2 - line_h + 2
@@ -372,7 +373,7 @@ def compliance_card(c, fx, fy, desc):
     c.rect(fx, card_rl, CW, CAPTION_H, stroke=0, fill=1)
     c.setFont("Lex-SemiBold", 9)
     c.setFillColor(DARK)
-    lines = textwrap.wrap(desc, 24)[:3]
+    lines = textwrap.wrap(desc, 28)[:4]
     line_h = 11
     total_h = len(lines) * line_h
     start_y = card_rl + (CAPTION_H + total_h) / 2 - line_h + 2
