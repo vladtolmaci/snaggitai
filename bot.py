@@ -200,6 +200,22 @@ def append_defect_to_zone(zone_id: str, defect: dict):
     update_zone(zone_id, defects=defects)
 
 
+def append_defects_to_zone_batch(zone_id: str, new_defects: list):
+    """v4.2.4: Append MULTIPLE defects in a single Supabase round-trip.
+
+    Previously, a bulk save of N photos triggered 2N synchronous HTTP calls
+    (1 get + 1 update per defect), which blocked the event loop and froze
+    the bot for other users. This batches them into 1 get + 1 update total.
+    """
+    if not new_defects:
+        return 0
+    zone = get_zone_by_id(zone_id)
+    defects = zone.get("defects") or []
+    defects.extend(new_defects)
+    update_zone(zone_id, defects=defects)
+    return len(new_defects)
+
+
 def delete_last_defect_from_zone(zone_id: str) -> bool:
     zone = get_zone_by_id(zone_id)
     defects = zone.get("defects") or []
@@ -859,9 +875,11 @@ async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     media_group_id = update.message.media_group_id  # may be None
     queue = context.user_data.setdefault("_bulk_queue", [])
     queue_was_empty = (len(queue) == 0)
+    user_id = update.effective_user.id if update.effective_user else "?"
 
     # FAST PATH: single photo, no active bulk session → original direct flow
     if media_group_id is None and queue_was_empty:
+        logger.info(f"[u{user_id}] defect_photo: single fast path")
         context.user_data["_temp_photo_file_id"] = photo.file_id
         await update.message.reply_text(
             "📸 Photo received.\n\n<b>Select severity:</b>",
@@ -871,10 +889,11 @@ async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return DEFECT_SEVERITY
 
     # BULK PATH: media_group OR queue already accumulating → join the queue
-    is_first_photo = queue_was_empty  # first photo of a NEW bulk session
+    is_first_photo = queue_was_empty
     queue.append({"file_id": photo.file_id, "media_group_id": media_group_id})
     if media_group_id:
         context.user_data["_bulk_media_group_id"] = media_group_id
+    logger.info(f"[u{user_id}] defect_photo: enqueued (mg={media_group_id}, total={len(queue)})")
 
     # Cancel previous debounce job (if any) and schedule a new one
     old_job = context.user_data.get("_bulk_job")
@@ -909,37 +928,49 @@ async def _bulk_finalize_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     queue = context.user_data.get("_bulk_queue", [])
     n = len(queue)
+    logger.info(f"[chat{chat_id}] _bulk_finalize_job fired, n={n}")
     if n == 0:
         return  # nothing to do (race condition)
 
     context.user_data.pop("_bulk_job", None)
 
-    if n == 1:
-        # Edge case: media_group with single photo — fall back to single flow
-        context.user_data["_temp_photo_file_id"] = queue[0]["file_id"]
-        context.user_data["_bulk_queue"] = []
+    try:
+        if n == 1:
+            # Edge case: media_group with single photo — fall back to single flow
+            context.user_data["_temp_photo_file_id"] = queue[0]["file_id"]
+            context.user_data["_bulk_queue"] = []
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="📸 Photo received.\n\n<b>Select severity:</b>",
+                parse_mode="HTML",
+                reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
+            )
+            return
+
+        buttons = [
+            [InlineKeyboardButton("⚡ Same severity for all", callback_data="bulk:same")],
+            [InlineKeyboardButton("📝 Per-photo (one by one)", callback_data="bulk:perphoto")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="bulk:cancel")],
+        ]
         await context.bot.send_message(
             chat_id=chat_id,
-            text="📸 Photo received.\n\n<b>Select severity:</b>",
+            text=f"📸 <b>{n} photos received</b>.\n\n"
+                 "How do you want to classify them?\n\n"
+                 "• <b>Same severity</b>: tap one severity + one description, all photos get it (great for batches of compliant MEP tests).\n"
+                 "• <b>Per-photo</b>: bot sends each photo back, you classify each individually.",
             parse_mode="HTML",
-            reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
-        return
-
-    buttons = [
-        [InlineKeyboardButton("⚡ Same severity for all", callback_data="bulk:same")],
-        [InlineKeyboardButton("📝 Per-photo (one by one)", callback_data="bulk:perphoto")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="bulk:cancel")],
-    ]
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"📸 <b>{n} photos received</b>.\n\n"
-             "How do you want to classify them?\n\n"
-             "• <b>Same severity</b>: tap one severity + one description, all photos get it (great for batches of compliant MEP tests).\n"
-             "• <b>Per-photo</b>: bot sends each photo back, you classify each individually.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    except Exception as e:
+        logger.error(f"[chat{chat_id}] _bulk_finalize_job failed: {e!r}", exc_info=True)
+        # Notify user so they know to retry
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Failed to process photos. Tap /start to recover.",
+            )
+        except Exception:
+            pass
 
 
 async def bulk_mode_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -949,6 +980,8 @@ async def bulk_mode_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     action = query.data.split(":", 1)[1]
     queue = context.user_data.get("_bulk_queue", [])
     n = len(queue)
+    user_id = query.from_user.id if query.from_user else "?"
+    logger.info(f"[u{user_id}] bulk_mode_choice: action={action}, n={n}")
 
     if action == "cancel":
         # Idempotent: works whether queue still has photos or has already been processed.
@@ -1054,10 +1087,11 @@ async def _save_bulk_defects(message_or_query, context, desc: str, via_message: 
     zone_id = context.user_data["_current_zone_id"]
     user_id = message_or_query.from_user.id  # both Message and CallbackQuery have this
     desc_clean = clean_unicode(desc)
+    logger.info(f"[u{user_id}] _save_bulk_defects: severity={severity}, n={len(queue)}, zone={zone_id}")
 
-    saved = 0
-    for item in queue:
-        defect = {
+    # Build all defects in memory first, then save with a single Supabase round-trip
+    new_defects = [
+        {
             "id": str(uuid4()),
             "severity": severity,
             "description": desc_clean,
@@ -1066,8 +1100,28 @@ async def _save_bulk_defects(message_or_query, context, desc: str, via_message: 
             "added_by": user_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        append_defect_to_zone(zone_id, defect)
-        saved += 1
+        for item in queue
+    ]
+    try:
+        saved = append_defects_to_zone_batch(zone_id, new_defects)
+    except Exception as e:
+        logger.error(f"[u{user_id}] bulk save failed: {e!r}", exc_info=True)
+        # Notify the user instead of letting the bot freeze
+        err_text = "⚠️ Failed to save defects. Try /start to recover."
+        if via_message:
+            await message_or_query.reply_text(err_text)
+        else:
+            try:
+                await message_or_query.edit_message_text(err_text)
+            except Exception:
+                pass
+        # Clear state so user isn't stuck
+        context.user_data["_bulk_queue"] = []
+        context.user_data.pop("_bulk_severity", None)
+        context.user_data.pop("_bulk_media_group_id", None)
+        return AFTER_DEFECT
+
+    logger.info(f"[u{user_id}] bulk save OK: {saved} defects")
 
     # Clear bulk state
     context.user_data["_bulk_queue"] = []
@@ -1975,7 +2029,32 @@ def build_app():
     )
 
     app.add_handler(conv)
+    app.add_error_handler(_error_handler)
     return app
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch ALL uncaught exceptions in any handler and log full traceback.
+
+    Without this, PTB silently swallows exceptions, causing the bot to appear frozen
+    (callback runs, throws, no reply, conversation state stuck).
+    """
+    import traceback as _tb
+    err = context.error
+    tb_str = "".join(_tb.format_exception(type(err), err, err.__traceback__))
+    logger.error(f"Unhandled exception in handler: {err!r}\n{tb_str}")
+
+    # Try to notify the user that something went wrong, so they don't think the bot is frozen
+    try:
+        if isinstance(update, Update):
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            if chat_id:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Something went wrong. Tap /start to recover, or /cancel to end.",
+                )
+    except Exception as e:
+        logger.error(f"Failed to notify user about error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
