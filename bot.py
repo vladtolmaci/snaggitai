@@ -877,7 +877,7 @@ async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         chat_id = update.effective_chat.id
         job = context.application.job_queue.run_once(
             _bulk_finalize_job,
-            when=10.0,  # debounce window — covers Telegram's 10-photo-per-album limit
+            when=15.0,  # debounce window — accommodates slower mobile uploads + multi-album batches
             chat_id=chat_id,
             user_id=update.effective_user.id,
             data={"chat_id": chat_id, "user_id": update.effective_user.id},
@@ -888,7 +888,7 @@ async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         # Tell the user we're accumulating (only on first photo of a batch to avoid spam)
         if is_first_photo:
             await update.message.reply_text(
-                "📸 Receiving photos…\nKeep sending. I'll show options once you stop (~10s).",
+                "📸 Receiving photos…\nKeep sending. I'll show options once you stop (~15s).",
             )
         return DEFECT_PHOTO  # stay in same state; finalize will switch state via message
 
@@ -949,14 +949,33 @@ async def bulk_mode_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     n = len(queue)
 
     if action == "cancel":
+        # Idempotent: works whether queue still has photos or has already been processed.
+        # Also cancels any pending finalize job (e.g. user hit cancel before debounce fired).
+        old_job = context.user_data.get("_bulk_job")
+        if old_job:
+            try:
+                old_job.schedule_removal()
+            except Exception:
+                pass
+            context.user_data.pop("_bulk_job", None)
+
         context.user_data["_bulk_queue"] = []
+        context.user_data.pop("_bulk_severity", None)
+        context.user_data.pop("_bulk_media_group_id", None)
+
         zone_id = context.user_data.get("_current_zone_id")
         zone = get_zone_by_id(zone_id) if zone_id else None
-        await query.edit_message_text(
-            f"❌ Cancelled. {n} photos discarded.\n\n"
-            f"📸 <b>{zone['name'] if zone else 'Zone'}</b>: send a photo, or /skip.",
-            parse_mode="HTML",
-        )
+        msg = (f"❌ Cancelled. {n} photos discarded.\n\n"
+               f"📸 <b>{zone['name'] if zone else 'Zone'}</b>: send a photo, or /skip.") if n > 0 \
+              else "❌ Already cancelled."
+        try:
+            await query.edit_message_text(msg, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"bulk cancel edit_message_text failed: {e}")
+            # Fallback to a new message
+            await context.bot.send_message(
+                chat_id=query.message.chat_id, text=msg, parse_mode="HTML"
+            )
         return DEFECT_PHOTO
 
     if action == "same":
@@ -1921,10 +1940,12 @@ def build_app():
             ],
             BULK_SEVERITY: [
                 CallbackQueryHandler(bulk_severity_handler, pattern=r"^bulksev:"),
+                CallbackQueryHandler(bulk_mode_choice, pattern=r"^bulk:"),  # allow Cancel on old prompt
             ],
             BULK_DESC: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_desc_text),
                 CallbackQueryHandler(bulk_desc_callback, pattern=r"^bulkdesc:"),
+                CallbackQueryHandler(bulk_mode_choice, pattern=r"^bulk:"),  # allow Cancel on old prompt
             ],
 
             # Edit defect
@@ -1947,7 +1968,42 @@ def build_app():
     )
 
     app.add_handler(conv)
+
+    # Global fallback for bulk: callbacks — catches edge cases where the ConversationHandler
+    # state has desynced (e.g. user taps Cancel on an old prompt after timeout, or job_queue fired
+    # after conversation moved on). This handler runs at default group so ConversationHandler
+    # has first chance; if it doesn't claim the callback, we handle it here so the button still works.
+    from telegram.ext import CallbackQueryHandler as _CQH
+    app.add_handler(_CQH(_bulk_global_fallback, pattern=r"^bulk:"), group=1)
     return app
+
+
+async def _bulk_global_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Last-resort handler for bulk: buttons when conversation state has moved on."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    action = query.data.split(":", 1)[1] if ":" in query.data else ""
+
+    # Always clean up any lingering bulk state
+    context.user_data["_bulk_queue"] = []
+    context.user_data.pop("_bulk_severity", None)
+    context.user_data.pop("_bulk_media_group_id", None)
+    old_job = context.user_data.pop("_bulk_job", None)
+    if old_job:
+        try:
+            old_job.schedule_removal()
+        except Exception:
+            pass
+
+    try:
+        await query.edit_message_text(
+            f"❌ Bulk session cancelled.\n\nUse /start or send a photo to continue.",
+        )
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
