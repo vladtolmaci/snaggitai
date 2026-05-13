@@ -74,7 +74,9 @@ except ImportError:
     RESUME_MENU,                                          # 25
     # Edit defect
     EDIT_PICK_DEFECT, EDIT_DEFECT_SEV, EDIT_DEFECT_DESC,  # 26-28
-) = range(29)
+    # Bulk upload flow (v4.2)
+    BULK_MODE_CHOICE, BULK_SEVERITY, BULK_DESC,           # 29-31
+) = range(32)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 PROPERTY_TYPES = ["Apartment", "Villa", "Townhouse", "Penthouse", "Duplex", "Studio", "Office"]
@@ -841,19 +843,276 @@ def _get_mep_checklist_text(zone_name: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive defect photo → go straight to manual severity selection (no AI classification)."""
+    """Receive defect photo.
+
+    v4.2: If photo is part of a media group (album), accumulate into a queue and debounce.
+    After the album finishes, ask: bulk severity for all, or per-photo flow?
+    Single photos go to the regular flow (photo → severity → desc).
+    """
     if not update.message.photo:
         await update.message.reply_text("📸 Please send a photo. Or /skip if no photo available.")
         return DEFECT_PHOTO
 
-    # Get the largest photo
     photo = update.message.photo[-1]
+    media_group_id = update.message.media_group_id
 
-    # Store photo file_id (we no longer need bytes in memory — AI vision was removed)
+    if media_group_id:
+        # Part of an album — accumulate and debounce
+        queue = context.user_data.setdefault("_bulk_queue", [])
+        is_first_photo = len(queue) == 0
+        queue.append({"file_id": photo.file_id, "media_group_id": media_group_id})
+        context.user_data["_bulk_media_group_id"] = media_group_id
+
+        # Schedule a single debounced processor — cancel previous if any
+        old_job = context.user_data.get("_bulk_job")
+        if old_job:
+            try:
+                old_job.schedule_removal()
+            except Exception:
+                pass
+
+        # Schedule new debounce job
+        # v4.2.1: 10-second window allows accumulating multiple albums (e.g. 100 photos = 10 albums of 10)
+        # into a single bulk operation. Each new photo resets the timer.
+        chat_id = update.effective_chat.id
+        job = context.application.job_queue.run_once(
+            _bulk_finalize_job,
+            when=10.0,  # debounce window — covers Telegram's 10-photo-per-album limit
+            chat_id=chat_id,
+            user_id=update.effective_user.id,
+            data={"chat_id": chat_id, "user_id": update.effective_user.id},
+            name=f"bulk_{chat_id}_{media_group_id}",
+        )
+        context.user_data["_bulk_job"] = job
+
+        # Tell the user we're accumulating (only on first photo of a batch to avoid spam)
+        if is_first_photo:
+            await update.message.reply_text(
+                "📸 Receiving photos…\nKeep sending. I'll show options once you stop (~10s).",
+            )
+        return DEFECT_PHOTO  # stay in same state; finalize will switch state via message
+
+    # ── Single photo path (unchanged) ──
     context.user_data["_temp_photo_file_id"] = photo.file_id
-
     await update.message.reply_text(
         "📸 Photo received.\n\n<b>Select severity:</b>",
+        parse_mode="HTML",
+        reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
+    )
+    return DEFECT_SEVERITY
+
+
+async def _bulk_finalize_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job that fires after the media-group debounce window — shows bulk mode prompt."""
+    chat_id = context.job.chat_id
+    queue = context.user_data.get("_bulk_queue", [])
+    n = len(queue)
+    if n == 0:
+        return  # nothing to do (race condition)
+
+    context.user_data.pop("_bulk_job", None)
+
+    if n == 1:
+        # Edge case: media_group with single photo — fall back to single flow
+        context.user_data["_temp_photo_file_id"] = queue[0]["file_id"]
+        context.user_data["_bulk_queue"] = []
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📸 Photo received.\n\n<b>Select severity:</b>",
+            parse_mode="HTML",
+            reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton("⚡ Same severity for all", callback_data="bulk:same")],
+        [InlineKeyboardButton("📝 Per-photo (one by one)", callback_data="bulk:perphoto")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="bulk:cancel")],
+    ]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"📸 <b>{n} photos received</b>.\n\n"
+             "How do you want to classify them?\n\n"
+             "• <b>Same severity</b>: tap one severity + one description, all photos get it (great for batches of compliant MEP tests).\n"
+             "• <b>Per-photo</b>: bot sends each photo back, you classify each individually.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def bulk_mode_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle bulk:same / bulk:perphoto / bulk:cancel."""
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    queue = context.user_data.get("_bulk_queue", [])
+    n = len(queue)
+
+    if action == "cancel":
+        context.user_data["_bulk_queue"] = []
+        zone_id = context.user_data.get("_current_zone_id")
+        zone = get_zone_by_id(zone_id) if zone_id else None
+        await query.edit_message_text(
+            f"❌ Cancelled. {n} photos discarded.\n\n"
+            f"📸 <b>{zone['name'] if zone else 'Zone'}</b>: send a photo, or /skip.",
+            parse_mode="HTML",
+        )
+        return DEFECT_PHOTO
+
+    if action == "same":
+        await query.edit_message_text(
+            f"⚡ Bulk mode: <b>{n} photos</b> will all get the same severity + description.\n\n"
+            "<b>Select severity:</b>",
+            parse_mode="HTML",
+            reply_markup=inline_kb(SEVERITY_OPTIONS, "bulksev"),
+        )
+        return BULK_SEVERITY
+
+    if action == "perphoto":
+        # Start per-photo loop: pop first, send it back, ask for severity
+        return await _bulk_send_next_photo(query, context)
+
+    return DEFECT_PHOTO
+
+
+async def bulk_severity_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User picked one severity for the whole batch → now ask for one description."""
+    query = update.callback_query
+    await query.answer()
+    severity = query.data.split(":", 1)[1]
+    context.user_data["_bulk_severity"] = severity
+    n = len(context.user_data.get("_bulk_queue", []))
+
+    sev_emoji = {"critical": "🔴", "medium": "🟠", "minor": "🟡", "compliant": "🟢"}.get(severity, "⚪")
+    if severity == "compliant":
+        is_mep = context.user_data.get("_is_mep", False)
+        default_buttons = [
+            [InlineKeyboardButton("✅ Functional and compliant", callback_data="bulkdesc:Functional and compliant")],
+        ]
+        if not is_mep:
+            default_buttons.append(
+                [InlineKeyboardButton("✅ In good condition, no issues", callback_data="bulkdesc:In good condition, no issues")]
+            )
+        await query.edit_message_text(
+            f"⚡ Bulk: {sev_emoji} <b>compliant</b> × {n} photos\n\n"
+            "Type one description for all, or tap a default:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(default_buttons),
+        )
+    else:
+        await query.edit_message_text(
+            f"⚡ Bulk: {sev_emoji} <b>{severity}</b> × {n} photos\n\n"
+            "📝 Type one description that applies to all:",
+            parse_mode="HTML",
+        )
+    return BULK_DESC
+
+
+async def bulk_desc_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User typed description → save all photos with bulk severity+desc."""
+    desc = update.message.text.strip()
+    return await _save_bulk_defects(update, context, desc, via_message=True)
+
+
+async def bulk_desc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped a default-description button in bulk compliant mode."""
+    query = update.callback_query
+    await query.answer()
+    desc = query.data.split(":", 1)[1]
+    return await _save_bulk_defects(query, context, desc, via_message=False)
+
+
+async def _save_bulk_defects(update_or_query, context, desc: str, via_message: bool) -> int:
+    """Persist all queued photos as separate defects with the same severity + desc."""
+    severity = context.user_data.get("_bulk_severity", "minor")
+    queue = context.user_data.get("_bulk_queue", [])
+    zone_id = context.user_data["_current_zone_id"]
+    user_id = (update_or_query.from_user.id if via_message
+               else update_or_query.from_user.id)
+    desc_clean = clean_unicode(desc)
+
+    saved = 0
+    for item in queue:
+        defect = {
+            "id": str(uuid4()),
+            "severity": severity,
+            "description": desc_clean,
+            "photo_file_id": item["file_id"],
+            "photo_path": "",
+            "added_by": user_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        append_defect_to_zone(zone_id, defect)
+        saved += 1
+
+    # Clear bulk state
+    context.user_data["_bulk_queue"] = []
+    context.user_data.pop("_bulk_severity", None)
+    context.user_data.pop("_bulk_media_group_id", None)
+
+    zone = get_zone_by_id(zone_id)
+    count = len(zone.get("defects") or [])
+    sev_emoji = {"critical": "🔴", "medium": "🟠", "minor": "🟡", "compliant": "🟢"}.get(severity, "⚪")
+
+    buttons = [
+        [InlineKeyboardButton("📸 Add more defects", callback_data="after:photo")],
+        [InlineKeyboardButton("🔄 Switch zone", callback_data="after:switch")],
+        [InlineKeyboardButton("✏️ Edit defects", callback_data="after:edit")],
+        [InlineKeyboardButton("🏁 Finish inspection", callback_data="after:finish")],
+    ]
+    text = (f"✅ Saved <b>{saved} defects</b>: {sev_emoji} {severity} — {desc_clean[:60]}\n\n"
+            f"📍 Zone <b>{zone['name']}</b> now has {count} defects total.")
+    if via_message:
+        await update_or_query.message.reply_text(
+            text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    else:
+        await update_or_query.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    return AFTER_DEFECT
+
+
+async def _bulk_send_next_photo(query, context) -> int:
+    """Per-photo mode: pop next file_id from queue, send it back to user, ask for severity."""
+    queue = context.user_data.get("_bulk_queue", [])
+    if not queue:
+        # Done with batch
+        zone_id = context.user_data["_current_zone_id"]
+        zone = get_zone_by_id(zone_id)
+        count = len(zone.get("defects") or [])
+        buttons = [
+            [InlineKeyboardButton("📸 Add more defects", callback_data="after:photo")],
+            [InlineKeyboardButton("🔄 Switch zone", callback_data="after:switch")],
+            [InlineKeyboardButton("✏️ Edit defects", callback_data="after:edit")],
+            [InlineKeyboardButton("🏁 Finish inspection", callback_data="after:finish")],
+        ]
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"✅ Batch complete. Zone <b>{zone['name']}</b> now has {count} defects.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return AFTER_DEFECT
+
+    item = queue.pop(0)
+    context.user_data["_bulk_queue"] = queue
+    context.user_data["_temp_photo_file_id"] = item["file_id"]
+    remaining = len(queue)
+
+    # Send photo back + severity prompt
+    caption = (f"📸 Classify this photo. {remaining} more in queue."
+               if remaining else "📸 Classify this photo. Last one in queue.")
+    await context.bot.send_photo(
+        chat_id=query.message.chat_id,
+        photo=item["file_id"],
+        caption=caption,
+    )
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="<b>Select severity:</b>",
         parse_mode="HTML",
         reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
     )
@@ -863,7 +1122,6 @@ async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def skip_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """No photo available — go to manual severity anyway."""
     context.user_data["_temp_photo_file_id"] = None
-
     await update.message.reply_text(
         "Select severity:",
         reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
@@ -941,6 +1199,11 @@ async def _save_defect(query, context, severity: str, description: str) -> int:
     context.user_data.pop("_temp_photo_file_id", None)
     context.user_data.pop("_manual_severity", None)
 
+    # v4.2: If we're in per-photo bulk mode and there are more photos queued, continue
+    bulk_queue = context.user_data.get("_bulk_queue", [])
+    if bulk_queue:
+        return await _bulk_send_next_photo(query, context)
+
     zone = get_zone_by_id(zone_id)
     count = len(zone.get("defects") or [])
     sev_emoji = {"critical": "🔴", "medium": "🟠", "minor": "🟡", "compliant": "🟢"}.get(severity, "⚪")
@@ -949,7 +1212,6 @@ async def _save_defect(query, context, severity: str, description: str) -> int:
         [InlineKeyboardButton("📸 Add another defect", callback_data="after:photo")],
         [InlineKeyboardButton("✏️ Edit a defect", callback_data="after:edit")],
         [InlineKeyboardButton("🔄 Switch zone", callback_data="after:switch")],
-        [InlineKeyboardButton("🗑 Delete last defect", callback_data="after:delete")],
         [InlineKeyboardButton("🏁 Finish inspection & generate PDF", callback_data="after:finish")],
     ]
 
@@ -981,6 +1243,16 @@ async def _save_defect_msg(update: Update, context, severity: str, description: 
     context.user_data.pop("_temp_photo_file_id", None)
     context.user_data.pop("_manual_severity", None)
 
+    # v4.2: per-photo bulk mode — continue with next photo
+    bulk_queue = context.user_data.get("_bulk_queue", [])
+    if bulk_queue:
+        # Build a fake query-like wrapper for _bulk_send_next_photo
+        class _Q:
+            def __init__(self, msg):
+                self.message = msg
+                self.from_user = msg.from_user
+        return await _bulk_send_next_photo(_Q(update.message), context)
+
     zone = get_zone_by_id(zone_id)
     count = len(zone.get("defects") or [])
     sev_emoji = {"critical": "🔴", "medium": "🟠", "minor": "🟡", "compliant": "🟢"}.get(severity, "⚪")
@@ -989,7 +1261,6 @@ async def _save_defect_msg(update: Update, context, severity: str, description: 
         [InlineKeyboardButton("📸 Add another defect", callback_data="after:photo")],
         [InlineKeyboardButton("✏️ Edit a defect", callback_data="after:edit")],
         [InlineKeyboardButton("🔄 Switch zone", callback_data="after:switch")],
-        [InlineKeyboardButton("🗑 Delete last defect", callback_data="after:delete")],
         [InlineKeyboardButton("🏁 Finish inspection & generate PDF", callback_data="after:finish")],
     ]
 
@@ -1028,26 +1299,6 @@ async def after_defect_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "edit":
         return await _show_defect_list_for_edit(query, context)
-
-    elif action == "delete":
-        zone_id = context.user_data["_current_zone_id"]
-        deleted = delete_last_defect_from_zone(zone_id)
-        if deleted:
-            zone = get_zone_by_id(zone_id)
-            n = len(zone.get("defects") or [])
-            await query.edit_message_text(
-                f"🗑 Last defect deleted. Zone <b>{zone['name']}</b> now has {n} defects.\n\n"
-                "📸 Send next photo, or:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Switch zone", callback_data="after:switch")],
-                    [InlineKeyboardButton("🏁 Finish inspection", callback_data="after:finish")],
-                ]),
-            )
-            return DEFECT_PHOTO
-        else:
-            await query.answer("No defects to delete.", show_alert=True)
-            return AFTER_DEFECT
 
     elif action == "finish":
         return await _try_finish(query, context)
@@ -1102,7 +1353,6 @@ async def edit_pick_defect_handler(update: Update, context: ContextTypes.DEFAULT
             [InlineKeyboardButton("📸 Add another defect", callback_data="after:photo")],
             [InlineKeyboardButton("✏️ Edit a defect", callback_data="after:edit")],
             [InlineKeyboardButton("🔄 Switch zone", callback_data="after:switch")],
-            [InlineKeyboardButton("🗑 Delete last defect", callback_data="after:delete")],
             [InlineKeyboardButton("🏁 Finish inspection & generate PDF", callback_data="after:finish")],
         ]
         await query.edit_message_text(
@@ -1647,6 +1897,7 @@ def build_app():
             DEFECT_PHOTO: [
                 MessageHandler(filters.PHOTO, defect_photo),
                 CommandHandler("skip", skip_photo),
+                CallbackQueryHandler(bulk_mode_choice, pattern=r"^bulk:"),
             ],
             DEFECT_SEVERITY: [CallbackQueryHandler(defect_severity, pattern=r"^sev:")],
             DEFECT_DESC: [
@@ -1656,6 +1907,19 @@ def build_app():
             AFTER_DEFECT: [
                 CallbackQueryHandler(after_defect_handler, pattern=r"^after:"),
                 MessageHandler(filters.PHOTO, defect_photo),  # Quick photo = add another
+                CallbackQueryHandler(bulk_mode_choice, pattern=r"^bulk:"),  # bulk prompt after album
+            ],
+
+            # Bulk-upload flow (v4.2)
+            BULK_MODE_CHOICE: [
+                CallbackQueryHandler(bulk_mode_choice, pattern=r"^bulk:"),
+            ],
+            BULK_SEVERITY: [
+                CallbackQueryHandler(bulk_severity_handler, pattern=r"^bulksev:"),
+            ],
+            BULK_DESC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_desc_text),
+                CallbackQueryHandler(bulk_desc_callback, pattern=r"^bulkdesc:"),
             ],
 
             # Edit defect
