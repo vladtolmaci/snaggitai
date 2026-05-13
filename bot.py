@@ -845,61 +845,63 @@ def _get_mep_checklist_text(zone_name: str) -> str:
 async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Receive defect photo.
 
-    v4.2: If photo is part of a media group (album), accumulate into a queue and debounce.
-    After the album finishes, ask: bulk severity for all, or per-photo flow?
-    Single photos go to the regular flow (photo → severity → desc).
+    v4.2.3: Hybrid model.
+      - First photo with NO media_group and EMPTY queue → direct single-photo flow (fast).
+      - Otherwise (album member OR queue already accumulating) → join the queue and debounce.
+        This prevents the 21-photo split-flow bug where N album-photos + 1 single were
+        processed in two concurrent flows.
     """
     if not update.message.photo:
         await update.message.reply_text("📸 Please send a photo. Or /skip if no photo available.")
         return DEFECT_PHOTO
 
     photo = update.message.photo[-1]
-    media_group_id = update.message.media_group_id
+    media_group_id = update.message.media_group_id  # may be None
+    queue = context.user_data.setdefault("_bulk_queue", [])
+    queue_was_empty = (len(queue) == 0)
 
+    # FAST PATH: single photo, no active bulk session → original direct flow
+    if media_group_id is None and queue_was_empty:
+        context.user_data["_temp_photo_file_id"] = photo.file_id
+        await update.message.reply_text(
+            "📸 Photo received.\n\n<b>Select severity:</b>",
+            parse_mode="HTML",
+            reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
+        )
+        return DEFECT_SEVERITY
+
+    # BULK PATH: media_group OR queue already accumulating → join the queue
+    is_first_photo = queue_was_empty  # first photo of a NEW bulk session
+    queue.append({"file_id": photo.file_id, "media_group_id": media_group_id})
     if media_group_id:
-        # Part of an album — accumulate and debounce
-        queue = context.user_data.setdefault("_bulk_queue", [])
-        is_first_photo = len(queue) == 0
-        queue.append({"file_id": photo.file_id, "media_group_id": media_group_id})
         context.user_data["_bulk_media_group_id"] = media_group_id
 
-        # Schedule a single debounced processor — cancel previous if any
-        old_job = context.user_data.get("_bulk_job")
-        if old_job:
-            try:
-                old_job.schedule_removal()
-            except Exception:
-                pass
+    # Cancel previous debounce job (if any) and schedule a new one
+    old_job = context.user_data.get("_bulk_job")
+    if old_job:
+        try:
+            old_job.schedule_removal()
+        except Exception:
+            pass
 
-        # Schedule new debounce job
-        # v4.2.1: 10-second window allows accumulating multiple albums (e.g. 100 photos = 10 albums of 10)
-        # into a single bulk operation. Each new photo resets the timer.
-        chat_id = update.effective_chat.id
-        job = context.application.job_queue.run_once(
-            _bulk_finalize_job,
-            when=15.0,  # debounce window — accommodates slower mobile uploads + multi-album batches
-            chat_id=chat_id,
-            user_id=update.effective_user.id,
-            data={"chat_id": chat_id, "user_id": update.effective_user.id},
-            name=f"bulk_{chat_id}_{media_group_id}",
-        )
-        context.user_data["_bulk_job"] = job
-
-        # Tell the user we're accumulating (only on first photo of a batch to avoid spam)
-        if is_first_photo:
-            await update.message.reply_text(
-                "📸 Receiving photos…\nKeep sending. I'll show options once you stop (~15s).",
-            )
-        return DEFECT_PHOTO  # stay in same state; finalize will switch state via message
-
-    # ── Single photo path (unchanged) ──
-    context.user_data["_temp_photo_file_id"] = photo.file_id
-    await update.message.reply_text(
-        "📸 Photo received.\n\n<b>Select severity:</b>",
-        parse_mode="HTML",
-        reply_markup=inline_kb(SEVERITY_OPTIONS, "sev"),
+    chat_id = update.effective_chat.id
+    job = context.application.job_queue.run_once(
+        _bulk_finalize_job,
+        when=15.0,  # debounce window — accommodates slow mobile uploads + multi-album batches
+        chat_id=chat_id,
+        user_id=update.effective_user.id,
+        data={"chat_id": chat_id, "user_id": update.effective_user.id},
+        name=f"bulk_{chat_id}_{media_group_id or 'mix'}",
     )
-    return DEFECT_SEVERITY
+    context.user_data["_bulk_job"] = job
+
+    # Notify user we're accumulating — but only on first photo of the batch
+    if is_first_photo:
+        await update.message.reply_text(
+            "📸 Receiving photos…\nKeep sending more if you have them. "
+            "I'll show options once you stop (~15s).",
+        )
+    return DEFECT_PHOTO
 
 
 async def _bulk_finalize_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1922,6 +1924,9 @@ def build_app():
                 MessageHandler(filters.PHOTO, defect_photo),
                 CommandHandler("skip", skip_photo),
                 CallbackQueryHandler(bulk_mode_choice, pattern=r"^bulk:"),
+                # v4.2.3: single-photo case arrives via debounce queue → severity prompt
+                # is sent from job_queue, so we accept ^sev: here too.
+                CallbackQueryHandler(defect_severity, pattern=r"^sev:"),
             ],
             DEFECT_SEVERITY: [CallbackQueryHandler(defect_severity, pattern=r"^sev:")],
             DEFECT_DESC: [
@@ -1932,6 +1937,8 @@ def build_app():
                 CallbackQueryHandler(after_defect_handler, pattern=r"^after:"),
                 MessageHandler(filters.PHOTO, defect_photo),  # Quick photo = add another
                 CallbackQueryHandler(bulk_mode_choice, pattern=r"^bulk:"),  # bulk prompt after album
+                # v4.2.3: single-photo via debounce queue can land here too
+                CallbackQueryHandler(defect_severity, pattern=r"^sev:"),
             ],
 
             # Bulk-upload flow (v4.2)
@@ -1968,42 +1975,7 @@ def build_app():
     )
 
     app.add_handler(conv)
-
-    # Global fallback for bulk: callbacks — catches edge cases where the ConversationHandler
-    # state has desynced (e.g. user taps Cancel on an old prompt after timeout, or job_queue fired
-    # after conversation moved on). This handler runs at default group so ConversationHandler
-    # has first chance; if it doesn't claim the callback, we handle it here so the button still works.
-    from telegram.ext import CallbackQueryHandler as _CQH
-    app.add_handler(_CQH(_bulk_global_fallback, pattern=r"^bulk:"), group=1)
     return app
-
-
-async def _bulk_global_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Last-resort handler for bulk: buttons when conversation state has moved on."""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    action = query.data.split(":", 1)[1] if ":" in query.data else ""
-
-    # Always clean up any lingering bulk state
-    context.user_data["_bulk_queue"] = []
-    context.user_data.pop("_bulk_severity", None)
-    context.user_data.pop("_bulk_media_group_id", None)
-    old_job = context.user_data.pop("_bulk_job", None)
-    if old_job:
-        try:
-            old_job.schedule_removal()
-        except Exception:
-            pass
-
-    try:
-        await query.edit_message_text(
-            f"❌ Bulk session cancelled.\n\nUse /start or send a photo to continue.",
-        )
-    except Exception:
-        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
