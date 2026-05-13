@@ -1011,7 +1011,7 @@ async def bulk_severity_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def bulk_desc_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """User typed description → save all photos with bulk severity+desc."""
     desc = update.message.text.strip()
-    return await _save_bulk_defects(update, context, desc, via_message=True)
+    return await _save_bulk_defects(update.message, context, desc, via_message=True)
 
 
 async def bulk_desc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1022,13 +1022,16 @@ async def bulk_desc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return await _save_bulk_defects(query, context, desc, via_message=False)
 
 
-async def _save_bulk_defects(update_or_query, context, desc: str, via_message: bool) -> int:
-    """Persist all queued photos as separate defects with the same severity + desc."""
+async def _save_bulk_defects(message_or_query, context, desc: str, via_message: bool) -> int:
+    """Persist all queued photos as separate defects with the same severity + desc.
+
+    `message_or_query` is either a `telegram.Message` (when via_message=True)
+    or a `telegram.CallbackQuery` (when via_message=False). Both have `.from_user`.
+    """
     severity = context.user_data.get("_bulk_severity", "minor")
     queue = context.user_data.get("_bulk_queue", [])
     zone_id = context.user_data["_current_zone_id"]
-    user_id = (update_or_query.from_user.id if via_message
-               else update_or_query.from_user.id)
+    user_id = message_or_query.from_user.id  # both Message and CallbackQuery have this
     desc_clean = clean_unicode(desc)
 
     saved = 0
@@ -1063,12 +1066,14 @@ async def _save_bulk_defects(update_or_query, context, desc: str, via_message: b
     text = (f"✅ Saved <b>{saved} defects</b>: {sev_emoji} {severity} — {desc_clean[:60]}\n\n"
             f"📍 Zone <b>{zone['name']}</b> now has {count} defects total.")
     if via_message:
-        await update_or_query.message.reply_text(
+        # message_or_query is a Message — reply directly
+        await message_or_query.reply_text(
             text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
     else:
-        await update_or_query.edit_message_text(
+        # message_or_query is a CallbackQuery — edit the inline message
+        await message_or_query.edit_message_text(
             text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
