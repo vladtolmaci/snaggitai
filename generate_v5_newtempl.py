@@ -87,7 +87,10 @@ def photo_crop(src_path, tmp_path, tw, th):
         nw, nh = int(iw*scale)+1, int(ih*scale)+1
         img = img.resize((nw, nh), Image.LANCZOS)
         ox, oy = (nw-tw)//2, (nh-th)//2
-        img.crop((ox, oy, ox+tw, oy+th)).save(tmp_path, "JPEG", quality=93)
+        # quality=72 + optimize. For a 589-photo report this lands near 30 MB
+        # (well under Telegram's 50 MB bot limit). Cards are only ~176pt wide,
+        # so this is visually clean.
+        img.crop((ox, oy, ox+tw, oy+th)).save(tmp_path, "JPEG", quality=72, optimize=True)
         return True
     except:
         return False
@@ -312,7 +315,7 @@ def defect_card(c, fx, fy, sev, desc, photo=None):
     c.rect(fx, photo_rl, CW, PHOTO_H, stroke=0, fill=1)
     if photo and os.path.exists(photo):
         tmp = f"/tmp/c_{fx}_{abs(int(fy))}.jpg"
-        if photo_crop(photo, tmp, int(CW*4), int(PHOTO_H*4)):
+        if photo_crop(photo, tmp, int(CW*2.5), int(PHOTO_H*2.5)):
             c.drawImage(ImageReader(tmp), fx, photo_rl, CW, PHOTO_H)
         else:
             c.setFont("Lex-Light", 8)
