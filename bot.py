@@ -254,6 +254,76 @@ def get_members(inspection_id: str) -> list:
     return res.data
 
 
+def backup_inspection_json(inspection_id: str) -> str | None:
+    """Dump the FULL inspection (meta + zones + defects + photo file_ids) to Supabase Storage.
+
+    This is a safety net: even if PDF generation or delivery fails, the complete report
+    data can always be rebuilt from this JSON. Returns the public URL, or None on failure.
+    The defects already contain photo_file_id values, which never expire on Telegram's side,
+    so the report is fully reconstructable from this single file.
+    """
+    try:
+        inspection = get_inspection_by_id(inspection_id)
+        zones = get_zones(inspection_id)
+        members = get_members(inspection_id)
+        dump = {
+            "inspection": inspection,
+            "zones": zones,
+            "members": members,
+            "backed_up_at": datetime.now(timezone.utc).isoformat(),
+        }
+        raw = json.dumps(dump, ensure_ascii=False, default=str).encode("utf-8")
+        unit = (inspection.get("meta") or {}).get("unit", inspection_id)
+        safe_unit = re.sub(r"[^A-Za-z0-9_-]", "_", str(unit))
+        key = f"backups/{safe_unit}_{inspection_id}.json"
+        sb = _sb()
+        try:
+            sb.storage.from_("inspection-photos").upload(
+                key, raw,
+                {"content-type": "application/json", "upsert": "true"},
+            )
+        except Exception:
+            # Older supabase-py: upsert via update if it already exists
+            sb.storage.from_("inspection-photos").update(
+                key, raw, {"content-type": "application/json"},
+            )
+        url = sb.storage.from_("inspection-photos").get_public_url(key)
+        logger.info(f"Backup JSON saved for {inspection_id}: {url}")
+        return url
+    except Exception as e:
+        logger.error(f"backup_inspection_json failed for {inspection_id}: {e!r}", exc_info=True)
+        return None
+
+
+def upload_pdf_to_storage(pdf_path: str, inspection_id: str, unit: str) -> str | None:
+    """Upload the finished PDF to Supabase Storage and return a public download URL.
+
+    Used as a fallback when the PDF is larger than Telegram's 50 MB bot upload limit,
+    so the report can still be delivered via a link instead of an attachment.
+    """
+    try:
+        with open(pdf_path, "rb") as f:
+            raw = f.read()
+        safe_unit = re.sub(r"[^A-Za-z0-9_-]", "_", str(unit))
+        key = f"reports/{safe_unit}_{inspection_id}.pdf"
+        sb = _sb()
+        try:
+            sb.storage.from_("inspection-photos").upload(
+                key, raw,
+                {"content-type": "application/pdf", "upsert": "true"},
+            )
+        except Exception:
+            sb.storage.from_("inspection-photos").update(
+                key, raw, {"content-type": "application/pdf"},
+            )
+        url = sb.storage.from_("inspection-photos").get_public_url(key)
+        logger.info(f"PDF uploaded to storage for {inspection_id}: {url} ({len(raw)} bytes)")
+        return url
+    except Exception as e:
+        logger.error(f"upload_pdf_to_storage failed for {inspection_id}: {e!r}", exc_info=True)
+        return None
+
+
 def get_user_active_inspection(user_id: str) -> dict | None:
     """Find active (non-complete) inspection for this user."""
     res = (_sb().table("inspection_members")
@@ -1611,6 +1681,12 @@ async def _try_finish(query, context: ContextTypes.DEFAULT_TYPE) -> int:
     inspection = get_inspection_by_id(inspection_id)
     meta = inspection.get("meta", {})
 
+    # ── SAFETY NET: back up the full inspection data to Supabase Storage FIRST ──
+    # This happens before any PDF work, so the report data is recoverable even if
+    # PDF generation or delivery later fails. Photo file_ids are included and never
+    # expire on Telegram's side, so the whole report can be rebuilt from this dump.
+    backup_url = backup_inspection_json(inspection_id)
+
     # Count severities
     sev_counts = {"critical": 0, "medium": 0, "minor": 0, "compliant": 0}
     total = 0
@@ -1656,15 +1732,24 @@ async def _try_finish(query, context: ContextTypes.DEFAULT_TYPE) -> int:
         update_inspection(inspection_id, status="complete")
 
         err_text = str(e).replace("<", "&lt;").replace(">", "&gt;")
+        backup_line = (f"\n\n💾 Full data backup saved:\n{backup_url}" if backup_url
+                       else "\n\n💾 Your data is safe in Supabase (zones + defects + photos).")
         await query.message.reply_text(
-            f"❌ PDF generation failed:\n\n{err_text}\n\n"
-            f"Your data is safe in Supabase.\n"
-            f"Run locally: python3 generate_from_supabase.py {meta.get('unit', '?')}",
+            f"❌ PDF generation failed:\n\n{err_text}"
+            f"{backup_line}\n\n"
+            f"Nothing is lost — the report can be rebuilt from the backup above.",
         )
         return ConversationHandler.END
 
     # Mark complete
     update_inspection(inspection_id, status="complete")
+
+    # Upload the finished PDF to Storage too — permanent, recoverable copy + needed
+    # if the file is too big to send as a Telegram attachment.
+    pdf_size = os.path.getsize(pdf_path)
+    size_mb = pdf_size / (1024 * 1024)
+    logger.info(f"PDF size: {size_mb:.1f} MB")
+    storage_url = upload_pdf_to_storage(pdf_path, inspection_id, meta.get("unit", "report"))
 
     # Send PDF to ALL members
     members = get_members(inspection_id)
@@ -1676,8 +1761,40 @@ async def _try_finish(query, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"📸 {photo_count} photos | {len(zones)} zones"
     )
 
+    # Telegram bot upload limit is 50 MB. If the PDF is at/over ~48 MB, skip the
+    # attachment attempt and deliver the Storage link directly.
+    TELEGRAM_LIMIT_MB = 48
+    too_big = size_mb >= TELEGRAM_LIMIT_MB
+
     sent_count = 0
     fail_count = 0
+
+    if too_big:
+        logger.warning(f"PDF is {size_mb:.1f} MB (>{TELEGRAM_LIMIT_MB} MB) — delivering via link only")
+        link_text = (
+            f"{summary}\n\n"
+            f"📄 The report is large ({size_mb:.0f} MB) and exceeds Telegram's file limit, "
+            f"so here's a download link:\n{storage_url or '(upload failed — see backup below)'}"
+        )
+        if not storage_url and backup_url:
+            link_text += f"\n\n💾 Data backup: {backup_url}"
+        for member in members:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(member["user_id"]), text=link_text, parse_mode="HTML",
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.error(f"Link delivery to {member['user_id']} failed: {e}")
+                fail_count += 1
+        await query.message.reply_text(
+            f"📄 Report too large for direct send ({size_mb:.0f} MB).\n"
+            f"Download link sent to {sent_count}/{len(members)} member(s).\n"
+            f"🔗 {storage_url or backup_url or 'see logs'}",
+        )
+        return ConversationHandler.END
+
+    # Normal path: send as attachment, with retries
     for member in members:
         chat_id = int(member["user_id"])
         sent = False
@@ -1705,17 +1822,30 @@ async def _try_finish(query, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not sent:
             fail_count += 1
             logger.error(f"PDF delivery to {chat_id} failed after 3 attempts")
+            # Fallback: deliver the Storage link so the member still gets the report
+            if storage_url:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"{summary}\n\n📄 Couldn't send the file directly. Download it here:\n{storage_url}",
+                        parse_mode="HTML",
+                    )
+                    logger.info(f"Delivered Storage link to {chat_id} as fallback")
+                except Exception as e:
+                    logger.error(f"Link fallback to {chat_id} also failed: {e}")
 
     if fail_count > 0:
         await query.message.reply_text(
             f"{summary}\n\n"
-            f"📄 PDF sent to {sent_count}/{len(members)} member(s).\n"
-            f"❌ {fail_count} delivery failed — check logs.",
+            f"📄 PDF sent to {sent_count}/{len(members)} member(s) directly.\n"
+            f"🔗 Download link (always works): {storage_url or backup_url or 'see logs'}",
             parse_mode="HTML",
         )
     else:
         await query.message.reply_text(
-            f"{summary}\n\n📄 PDF sent to {sent_count} member(s).",
+            f"{summary}\n\n"
+            f"📄 PDF sent to {sent_count} member(s).\n"
+            f"🔗 Backup link: {storage_url or backup_url or 'n/a'}",
             parse_mode="HTML",
         )
     return ConversationHandler.END
