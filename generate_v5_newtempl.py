@@ -87,9 +87,10 @@ def photo_crop(src_path, tmp_path, tw, th):
         nw, nh = int(iw*scale)+1, int(ih*scale)+1
         img = img.resize((nw, nh), Image.LANCZOS)
         ox, oy = (nw-tw)//2, (nh-th)//2
-        # quality=93 — original full quality. Large reports may exceed Telegram's
-        # 50 MB bot limit; when that happens, bot.py delivers a download link instead.
-        img.crop((ox, oy, ox+tw, oy+th)).save(tmp_path, "JPEG", quality=93)
+        # quality=88 — near-full quality, keeps full x4 resolution. Brings a standard
+        # inspection to ~30 MB (was ~38 MB at q93). Large reports that still exceed
+        # Telegram's 50 MB bot limit are delivered via download link by bot.py.
+        img.crop((ox, oy, ox+tw, oy+th)).save(tmp_path, "JPEG", quality=88, optimize=True)
         return True
     except:
         return False
