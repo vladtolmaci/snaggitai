@@ -419,14 +419,14 @@ async def generate_ai_texts(meta: dict, zones: list) -> dict:
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-sonnet-4-6",
                     "max_tokens": 1500,
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
             data = resp.json()
             if "content" not in data:
-                logger.error(f"AI texts response missing 'content': {data}")
+                logger.error(f"AI texts response missing 'content' (HTTP {resp.status_code}): {data}")
                 return {}
             text = data["content"][0]["text"].strip()
             if text.startswith("```"):
