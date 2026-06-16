@@ -781,12 +781,35 @@ async def _begin_zone_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     inspection_id = context.user_data.get("_inspection_id")
+    # After a Railway redeploy/restart, in-memory user_data is wiped. If the user taps
+    # an old "Start inspecting" button, _inspection_id is gone — recover gracefully.
+    if not inspection_id:
+        user_id = str(query.from_user.id)
+        insp = get_user_active_inspection(user_id)
+        if insp:
+            inspection_id = insp["id"]
+            context.user_data["_inspection_id"] = inspection_id
+        else:
+            await query.edit_message_text(
+                "⚠️ Session expired (bot restarted). Tap /start to continue your inspection.",
+            )
+            return ConversationHandler.END
     return await _show_zone_picker(query, context, inspection_id)
 
 
 async def _show_zone_picker(message_or_query, context, inspection_id: str) -> int:
     """Show the zone selection keyboard."""
-    user_id = str(message_or_query.from_user.id) if hasattr(message_or_query, "from_user") else str(context._user_id)
+    # Resolve user_id robustly (CallbackQuery and Message both expose from_user)
+    user_id = str(getattr(message_or_query, "from_user", None).id) if getattr(message_or_query, "from_user", None) else None
+
+    if not inspection_id:
+        text = "⚠️ Session expired (bot restarted). Tap /start to continue."
+        if hasattr(message_or_query, "edit_message_text"):
+            await message_or_query.edit_message_text(text)
+        else:
+            await message_or_query.reply_text(text)
+        return ConversationHandler.END
+
     zones = get_zones(inspection_id)
     context.user_data["_inspection_id"] = inspection_id
 
@@ -862,6 +885,16 @@ async def zone_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if data.startswith("zone:start"):
         # "Start inspecting" button
         inspection_id = context.user_data.get("_inspection_id")
+        if not inspection_id:
+            insp = get_user_active_inspection(str(query.from_user.id))
+            if insp:
+                inspection_id = insp["id"]
+                context.user_data["_inspection_id"] = inspection_id
+            else:
+                await query.edit_message_text(
+                    "⚠️ Session expired (bot restarted). Tap /start to continue."
+                )
+                return ConversationHandler.END
         return await _show_zone_picker(query, context, inspection_id)
 
     parts = data.split(":", 2)
