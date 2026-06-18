@@ -409,8 +409,14 @@ async def generate_ai_texts(meta: dict, zones: list) -> dict:
     - For MEP zones specifically, phrase around systems tested. Example: "All electrical sockets were tested. 2 issues require attention."
     """)
 
+    # Output budget must scale with zone count: each zone needs ~400 chars of obs
+    # (~120 tokens), plus the three summary blocks. A flat 1500 was far too small
+    # for large inspections (e.g. 24 zones need ~3500 tokens) — the JSON got
+    # truncated, json.loads failed, and the report fell back to template text.
+    max_tokens = min(16000, 1200 + total_zones * 280)
+
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -420,7 +426,7 @@ async def generate_ai_texts(meta: dict, zones: list) -> dict:
                 },
                 json={
                     "model": "claude-sonnet-4-6",
-                    "max_tokens": 1500,
+                    "max_tokens": max_tokens,
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
@@ -428,18 +434,25 @@ async def generate_ai_texts(meta: dict, zones: list) -> dict:
             if "content" not in data:
                 logger.error(f"AI texts response missing 'content' (HTTP {resp.status_code}): {data}")
                 return {}
+            stop_reason = data.get("stop_reason")
+            if stop_reason == "max_tokens":
+                logger.error(f"AI texts TRUNCATED at max_tokens={max_tokens} for {total_zones} zones — JSON likely incomplete")
             text = data["content"][0]["text"].strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
                 if text.startswith("json"):
                     text = text[4:]
-            parsed = json.loads(text.strip())
+            try:
+                parsed = json.loads(text.strip())
+            except json.JSONDecodeError as je:
+                logger.error(f"AI texts JSON parse failed (stop_reason={stop_reason}, len={len(text)}): {je}. Raw start: {text[:200]}")
+                return {}
             # Normalize zone_obs keys to strings just in case
             if "zone_obs" in parsed and isinstance(parsed["zone_obs"], dict):
                 parsed["zone_obs"] = {str(k): v for k, v in parsed["zone_obs"].items()}
             return parsed
     except Exception as e:
-        logger.error(f"AI texts failed: {e}")
+        logger.error(f"AI texts failed: {e!r}")
         return {}
 
 
