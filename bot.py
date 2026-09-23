@@ -76,7 +76,17 @@ except ImportError:
     EDIT_PICK_DEFECT, EDIT_DEFECT_SEV, EDIT_DEFECT_DESC,  # 26-28
     # Bulk upload flow (v4.2)
     BULK_MODE_CHOICE, BULK_SEVERITY, BULK_DESC,           # 29-31
-) = range(32)
+    # v4.4: De-snagging (re-inspection pulling previous meta + zones)
+    DESNAG_UNIT,                                          # 32
+    # v4.4: Meta edit
+    META_EDIT_PICK, META_EDIT_VALUE,                      # 33-34
+    # v4.4: Zone management (add / rename / delete)
+    ZONE_MGMT_MENU, ZONE_ADD_NAME, ZONE_ADD_TYPE,         # 35-37
+    ZONE_RENAME_PICK, ZONE_RENAME_VALUE,                  # 38-39
+    ZONE_DELETE_PICK, ZONE_DELETE_CONFIRM,                # 40-41
+    # v4.4: Finish confirmation
+    FINISH_CONFIRM,                                       # 42
+) = range(43)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 PROPERTY_TYPES = ["Apartment", "Villa", "Townhouse", "Penthouse", "Duplex", "Studio", "Office"]
@@ -190,6 +200,48 @@ def get_zone_by_id(zone_id: str) -> dict | None:
 def update_zone(zone_id: str, **kwargs):
     kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
     _sb().table("inspection_zones").update(kwargs).eq("id", zone_id).execute()
+
+
+def delete_zone(zone_id: str):
+    """v4.4: Permanently delete a zone (and its defects)."""
+    _sb().table("inspection_zones").delete().eq("id", zone_id).execute()
+
+
+def renumber_zones(inspection_id: str):
+    """v4.4: After a delete, keep zone_number contiguous (1..N) so the PDF has no gaps.
+
+    Uses a two-pass update to avoid tripping the UNIQUE(inspection_id, zone_number)
+    constraint when shifting numbers down.
+    """
+    zones = get_zones(inspection_id)
+    # Pass 1: park everything at a high offset
+    for i, z in enumerate(zones, start=1):
+        update_zone(z["id"], zone_number=1000 + i)
+    # Pass 2: assign final contiguous numbers
+    for i, z in enumerate(zones, start=1):
+        update_zone(z["id"], zone_number=i)
+
+
+def find_previous_inspections_by_unit(unit: str, limit: int = 5) -> list:
+    """v4.4 De-snagging: find previous COMPLETE inspections matching a unit number.
+
+    Case-insensitive substring match on meta->>'unit', newest first. Returns full rows
+    (meta included) so the caller can reuse the metadata.
+
+    Supabase keeps rows indefinitely (no auto-expiry), so previous inspections are
+    always available for de-snagging unless manually deleted.
+    """
+    q = unit.strip()
+    if not q:
+        return []
+    res = (_sb().table("inspections")
+           .select("*")
+           .ilike("meta->>unit", f"%{q}%")
+           .eq("status", "complete")
+           .order("created_at", desc=True)
+           .limit(limit)
+           .execute())
+    return res.data or []
 
 
 def append_defect_to_zone(zone_id: str, defect: dict):
@@ -460,6 +512,20 @@ async def generate_ai_texts(meta: dict, zones: list) -> dict:
 #  KEYBOARD HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _cb_part(data: str, index: int, default: str = "") -> str:
+    """Safely extract a ':'-separated segment of callback_data.
+
+    Buttons outlive the code that made them (old messages, redeploys, deleted zones),
+    so callback_data can arrive malformed. Never raise — return `default` instead.
+    """
+    try:
+        parts = (data or "").split(":")
+        val = parts[index] if index < len(parts) else default
+        return val if val != "" else default
+    except Exception:
+        return default
+
+
 def inline_kb(options: list, prefix: str, columns: int = 2) -> InlineKeyboardMarkup:
     buttons = [InlineKeyboardButton(text=opt, callback_data=f"{prefix}:{opt}") for opt in options]
     rows = [buttons[i:i+columns] for i in range(0, len(buttons), columns)]
@@ -473,7 +539,7 @@ def zone_picker_kb(zones: list, user_id: str) -> InlineKeyboardMarkup:
         status = z["status"]
         assigned = z.get("assigned_to")
         name = z["name"]
-        ztype = " ⚡" if z["type"] == "mep" else ""
+        ztype = ""  # v4.5: MEP marker removed from UI
         n_defects = len(z.get("defects") or [])
 
         if status == "done":
@@ -488,6 +554,10 @@ def zone_picker_kb(zones: list, user_id: str) -> InlineKeyboardMarkup:
             label = f"📍 {z['zone_number']}. {name}{ztype}{extra}"
             buttons.append([InlineKeyboardButton(text=label, callback_data=f"zone:pick:{z['id']}")])
 
+    buttons.append([
+        InlineKeyboardButton(text="✏️ Edit details", callback_data="meta:edit"),
+        InlineKeyboardButton(text="⚙️ Manage zones", callback_data="zmgmt:menu"),
+    ])
     buttons.append([InlineKeyboardButton(text="🏁 Finish inspection", callback_data="zone:finish")])
     return InlineKeyboardMarkup(buttons)
 
@@ -508,6 +578,9 @@ def clean_unicode(text: str) -> str:
     }
     for k, v in replacements.items():
         text = text.replace(k, v)
+    # Postgres JSONB rejects \u0000 outright (save would fail), and other C0 control
+    # characters (except \t \n \r) render as garbage in the PDF. Strip them.
+    text = "".join(ch for ch in text if ch >= " " or ch in "\t\n\r")
     return text
 
 
@@ -532,6 +605,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     buttons = [
         [InlineKeyboardButton("🆕 New inspection", callback_data="start:new")],
+        [InlineKeyboardButton("🔄 De-snagging (re-inspection)", callback_data="start:desnag")],
         [InlineKeyboardButton("🔗 Join inspection", callback_data="start:join")],
     ]
     if active:
@@ -571,8 +645,23 @@ async def start_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return JOIN_CODE
 
+    elif data == "start:desnag":
+        # v4.4 De-snagging: re-inspection of a unit inspected before.
+        context.user_data["_role"] = "lead"
+        await query.edit_message_text(
+            "🔄 <b>De-snagging</b>\n\n"
+            "Enter the <b>Unit number</b> of the property you're re-inspecting.\n"
+            "I'll find the previous inspection and reuse its details and zones "
+            "(with today's date):",
+            parse_mode="HTML",
+        )
+        return DESNAG_UNIT
+
     elif data.startswith("start:resume:"):
-        inspection_id = data.split(":", 2)[2]
+        inspection_id = _cb_part(data, 2)
+        if not inspection_id or not get_inspection_by_id(inspection_id):
+            await query.edit_message_text("⚠️ That inspection is no longer available. Tap /start.")
+            return ConversationHandler.END
         context.user_data["_inspection_id"] = inspection_id
         return await _show_zone_picker(query, context, inspection_id)
 
@@ -699,34 +788,38 @@ async def h_year(u, c):       return await _handle_meta_text(u, c, YEAR_BUILT)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def setup_zone_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive zone name, ask for type."""
+    """Receive zone name and add it directly (all zones are 'regular' — MEP selection removed in v4.5)."""
     name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Please enter a zone name:")
+        return SETUP_ZONE_NAME
     context.user_data["_zone_count"] += 1
-    context.user_data["_pending_zone_name"] = name
+    context.user_data["_zones_setup"].append({"name": name, "type": "regular"})
+
+    zones_so_far = context.user_data["_zones_setup"]
+    zone_list = "\n".join(f"  {i+1}. {z['name']}" for i, z in enumerate(zones_so_far))
 
     await update.message.reply_text(
-        f"Zone {context.user_data['_zone_count']}: <b>{name}</b>\n\nWhat type?",
+        f"<b>Zones defined:</b>\n{zone_list}\n\n"
+        "📍 Enter name of next zone, or press ✅ Done:",
         parse_mode="HTML",
-        reply_markup=inline_kb(["Regular", "MEP"], "ztype"),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Done — start inspection", callback_data="zones:done")],
+        ]),
     )
-    return SETUP_ZONE_TYPE
+    return SETUP_ZONES_DONE
 
 
 async def setup_zone_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive zone type, ask for next zone or done."""
+    """Legacy handler (v4.5: type selection removed). Kept so any stale ztype: button
+    from an old message still resolves gracefully instead of being ignored."""
     query = update.callback_query
     await query.answer()
-    ztype = query.data.split(":", 1)[1].lower()
-    name = context.user_data.pop("_pending_zone_name", "Zone")
-
-    context.user_data["_zones_setup"].append({"name": name, "type": ztype})
-
-    zones_so_far = context.user_data["_zones_setup"]
-    zone_list = "\n".join(
-        f"  {i+1}. {z['name']} {'⚡' if z['type'] == 'mep' else '📍'}"
-        for i, z in enumerate(zones_so_far)
-    )
-
+    name = context.user_data.pop("_pending_zone_name", None)
+    if name:
+        context.user_data.setdefault("_zones_setup", []).append({"name": name, "type": "regular"})
+    zones_so_far = context.user_data.get("_zones_setup", [])
+    zone_list = "\n".join(f"  {i+1}. {z['name']}" for i, z in enumerate(zones_so_far))
     await query.edit_message_text(
         f"<b>Zones defined:</b>\n{zone_list}\n\n"
         "📍 Enter name of next zone, or press ✅ Done:",
@@ -770,7 +863,7 @@ async def setup_zones_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     update_inspection(inspection_id, status="active")
 
     zone_list = "\n".join(
-        f"  {i+1}. {z['name']} {'⚡' if z['type'] == 'mep' else '📍'}"
+        f"  {i+1}. {z['name']}"
         for i, z in enumerate(zones_setup)
     )
 
@@ -786,6 +879,114 @@ async def setup_zones_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             [InlineKeyboardButton("▶️ Start inspecting", callback_data="zones:start")],
         ]),
     )
+    return PICK_ZONE
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v4.4 DE-SNAGGING — re-inspection reusing previous meta + zone structure
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def desnag_unit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User typed a unit number. Find the previous inspection and clone it (no defects)."""
+    unit_query = update.message.text.strip()
+    user_id = str(update.effective_user.id)
+
+    try:
+        matches = find_previous_inspections_by_unit(unit_query)
+    except Exception as e:
+        logger.error(f"desnag lookup failed: {e!r}", exc_info=True)
+        matches = []
+
+    if not matches:
+        await update.message.reply_text(
+            f"❌ No completed inspection found for unit <b>{unit_query}</b>.\n\n"
+            "Check the number and try again, or /start and choose New inspection.",
+            parse_mode="HTML",
+        )
+        return DESNAG_UNIT
+
+    # If several previous inspections match, offer a short list to pick the right one.
+    if len(matches) > 1:
+        context.user_data["_desnag_candidates"] = {m["id"]: m for m in matches}
+        buttons = []
+        for m in matches:
+            mm = m.get("meta") or {}
+            label = f"{mm.get('project', '?')} — {mm.get('unit', '?')} ({mm.get('date', '?')})"
+            buttons.append([InlineKeyboardButton(label[:60], callback_data=f"desnag:pick:{m['id']}")])
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="desnag:cancel")])
+        await update.message.reply_text(
+            f"🔍 Found <b>{len(matches)}</b> previous inspections. Which one is it?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return DESNAG_UNIT
+
+    return await _desnag_create_from(update.message, context, matches[0], user_id)
+
+
+async def desnag_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User picked one of several matching previous inspections."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "desnag:cancel" or _cb_part(data, 1) not in ("pick", "cancel"):
+        context.user_data.pop("_desnag_candidates", None)
+        await query.edit_message_text("❌ De-snagging cancelled. /start to begin again.")
+        return ConversationHandler.END
+    prev_id = _cb_part(data, 2)
+    prev = (context.user_data.get("_desnag_candidates") or {}).get(prev_id) or (get_inspection_by_id(prev_id) if prev_id else None)
+    context.user_data.pop("_desnag_candidates", None)
+    if not prev:
+        await query.edit_message_text("❌ Couldn't load that inspection. /start to try again.")
+        return ConversationHandler.END
+    return await _desnag_create_from(query, context, prev, str(query.from_user.id))
+
+
+async def _desnag_create_from(message_or_query, context, prev: dict, user_id: str) -> int:
+    """Clone a previous inspection: same meta (fresh date) + same zones, zero defects."""
+    old_meta = dict(prev.get("meta") or {})
+    new_meta = {k: v for k, v in old_meta.items() if k != "date"}
+    new_meta["date"] = datetime.now().strftime("%d.%m.%Y")  # today, per spec
+
+    prev_zones = get_zones(prev["id"])
+
+    inspection = create_inspection(user_id, new_meta)
+    inspection_id = inspection["id"]
+    code = inspection["code"]
+
+    # Recreate the zone structure only (names + types), no defects.
+    for z in prev_zones:
+        add_zone(inspection_id, z["zone_number"], z["name"], z.get("type", "regular"))
+
+    add_member(inspection_id, user_id, new_meta.get("inspector", "Lead"), "lead")
+    update_inspection(inspection_id, status="active")
+
+    context.user_data["_inspection_id"] = inspection_id
+    context.user_data["_meta"] = new_meta
+    context.user_data["_role"] = "lead"
+
+    zone_list = "\n".join(
+        f"  {z['zone_number']}. {z['name']}"
+        for z in prev_zones
+    )
+    text = (
+        f"🔄 <b>De-snagging inspection created!</b>\n\n"
+        f"🏗 {new_meta.get('project', '?')} — Unit {new_meta.get('unit', '?')}\n"
+        f"📅 Date: {new_meta['date']} (today)\n"
+        f"📋 {len(prev_zones)} zones reused from previous inspection:\n{zone_list}\n\n"
+        f"🔑 <b>Join code: <code>{code}</code></b>\n"
+        f"Share this code with other inspectors.\n\n"
+        f"Press Start to begin re-inspecting:"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Start inspecting", callback_data="zones:start")],
+        [InlineKeyboardButton("✏️ Edit details first", callback_data="meta:edit")],
+    ])
+    from telegram import CallbackQuery as _CQ
+    if isinstance(message_or_query, _CQ):
+        await message_or_query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await message_or_query.reply_text(text, parse_mode="HTML", reply_markup=markup)
     return PICK_ZONE
 
 
@@ -893,7 +1094,7 @@ async def zone_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     data = query.data  # zone:pick:<id> / zone:done:<id> / zone:taken:<id> / zone:finish
 
     if data == "zone:finish":
-        return await _try_finish(query, context)
+        return await finish_confirm_prompt(query, context)  # v4.4: confirm first
 
     if data.startswith("zone:start"):
         # "Start inspecting" button
@@ -911,6 +1112,13 @@ async def zone_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return await _show_zone_picker(query, context, inspection_id)
 
     parts = data.split(":", 2)
+    if len(parts) < 3 or not parts[2]:
+        # Malformed / stale button — re-show the picker instead of crashing
+        inspection_id = context.user_data.get("_inspection_id")
+        if inspection_id:
+            return await _show_zone_picker(query, context, inspection_id)
+        await query.edit_message_text("⚠️ That button is no longer valid. Tap /start to continue.")
+        return ConversationHandler.END
     action = parts[1]
     zone_id = parts[2]
 
@@ -925,6 +1133,13 @@ async def zone_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if action == "pick":
         user_id = str(update.effective_user.id)
         zone = get_zone_by_id(zone_id)
+        if not zone:
+            # Zone was deleted (e.g. by another member) since this keyboard was drawn
+            await query.answer("This zone no longer exists.", show_alert=True)
+            inspection_id = context.user_data.get("_inspection_id")
+            if inspection_id:
+                return await _show_zone_picker(query, context, inspection_id)
+            return PICK_ZONE
 
         # Assign zone to this user (or re-enter if already assigned)
         update_zone(zone_id, assigned_to=user_id, status="in_progress")
@@ -1022,7 +1237,7 @@ async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     chat_id = update.effective_chat.id
     job = context.application.job_queue.run_once(
         _bulk_finalize_job,
-        when=15.0,  # debounce window — accommodates slow mobile uploads + multi-album batches
+        when=8.0,  # debounce window — fast, still covers Telegram's staggered album delivery
         chat_id=chat_id,
         user_id=update.effective_user.id,
         data={"chat_id": chat_id, "user_id": update.effective_user.id},
@@ -1034,7 +1249,7 @@ async def defect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if is_first_photo:
         await update.message.reply_text(
             "📸 Receiving photos…\nKeep sending more if you have them. "
-            "I'll show options once you stop (~15s).",
+            "I'll show options once you stop (~8s).",
         )
     return DEFECT_PHOTO
 
@@ -1479,7 +1694,7 @@ async def after_defect_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     """Handle after-defect menu."""
     query = update.callback_query
     await query.answer()
-    action = query.data.split(":", 1)[1]
+    action = _cb_part(query.data, 1)
 
     if action == "photo":
         zone = get_zone_by_id(context.user_data["_current_zone_id"])
@@ -1497,7 +1712,7 @@ async def after_defect_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return await _show_defect_list_for_edit(query, context)
 
     elif action == "finish":
-        return await _try_finish(query, context)
+        return await finish_confirm_prompt(query, context)  # v4.4: confirm first
 
     return AFTER_DEFECT
 
@@ -1539,11 +1754,14 @@ async def edit_pick_defect_handler(update: Update, context: ContextTypes.DEFAULT
     """User picked a defect to edit."""
     query = update.callback_query
     await query.answer()
-    data = query.data.split(":", 1)[1]
+    data = _cb_part(query.data, 1, "back")
 
-    if data == "back":
+    if data == "back" or not data.isdigit():
         # Go back to after-defect menu by showing zone status
-        zone = get_zone_by_id(context.user_data["_current_zone_id"])
+        zone = get_zone_by_id(context.user_data.get("_current_zone_id"))
+        if not zone:
+            await query.edit_message_text("⚠️ Zone no longer available. Tap /start to continue.")
+            return ConversationHandler.END
         n = len(zone.get("defects") or [])
         buttons = [
             [InlineKeyboardButton("📸 Add another defect", callback_data="after:photo")],
@@ -1561,8 +1779,13 @@ async def edit_pick_defect_handler(update: Update, context: ContextTypes.DEFAULT
     defect_idx = int(data)
     context.user_data["_edit_defect_idx"] = defect_idx
 
-    zone = get_zone_by_id(context.user_data["_current_zone_id"])
-    defect = (zone.get("defects") or [])[defect_idx]
+    zone = get_zone_by_id(context.user_data.get("_current_zone_id"))
+    defects = (zone.get("defects") or []) if zone else []
+    if defect_idx >= len(defects):
+        # Defect list changed (e.g. another member deleted one) since keyboard was drawn
+        await query.answer("That defect no longer exists.", show_alert=True)
+        return await _show_defect_list_for_edit(query, context)
+    defect = defects[defect_idx]
     sev = defect.get("severity", "?")
     desc = defect.get("description", "?")
     emoji = {"critical": "🔴", "medium": "🟠", "minor": "🟡", "compliant": "🟢"}.get(sev, "⚪")
@@ -1620,8 +1843,17 @@ async def edit_defect_sev_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("📝 Type the new description:")
         return EDIT_DEFECT_DESC
 
-    # Severity change
+    # Severity change — only accept known values (a stale/garbled button must never
+    # write an invalid severity into the zone's defects JSON)
     new_sev = action  # critical / medium / minor / compliant
+    if new_sev not in SEVERITY_OPTIONS:
+        await query.answer("Unknown action.", show_alert=True)
+        return await _show_defect_list_for_edit(query, context)
+    zone = get_zone_by_id(zone_id)
+    defects = (zone.get("defects") or []) if zone else []
+    if not (0 <= defect_idx < len(defects)):
+        await query.answer("That defect no longer exists.", show_alert=True)
+        return await _show_defect_list_for_edit(query, context)
     update_defect_in_zone(zone_id, defect_idx, severity=new_sev)
 
     zone = get_zone_by_id(zone_id)
@@ -1705,6 +1937,359 @@ async def _show_zone_picker_query(query, context, inspection_id: str) -> int:
         reply_markup=kb,
     )
     return PICK_ZONE
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v4.4 META EDIT — change any inspection detail after creation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _meta_edit_kb(meta: dict) -> InlineKeyboardMarkup:
+    """One button per meta field showing its current value."""
+    buttons = []
+    for state, key, num, prompt, options in META_FIELDS:
+        label_name = prompt.split("\n")[0].strip()
+        cur = str(meta.get(key, "—"))[:22]
+        buttons.append([InlineKeyboardButton(f"{label_name}: {cur}", callback_data=f"metaedit:{key}")])
+    buttons.append([InlineKeyboardButton("◀️ Back to zones", callback_data="metaedit:back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _resolve_inspection_id(query, context) -> str | None:
+    """Get inspection id from session, recovering from Supabase after a restart."""
+    inspection_id = context.user_data.get("_inspection_id")
+    if not inspection_id:
+        insp = get_user_active_inspection(str(query.from_user.id))
+        if insp:
+            inspection_id = insp["id"]
+            context.user_data["_inspection_id"] = inspection_id
+    return inspection_id
+
+
+async def meta_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show the list of meta fields to edit."""
+    query = update.callback_query
+    await query.answer()
+    inspection_id = await _resolve_inspection_id(query, context)
+    if not inspection_id:
+        await query.edit_message_text("⚠️ Session expired. Tap /start to continue.")
+        return ConversationHandler.END
+    insp = get_inspection_by_id(inspection_id)
+    meta = insp.get("meta") or {}
+    context.user_data["_meta"] = meta
+    await query.edit_message_text(
+        "✏️ <b>Edit inspection details</b>\n\nTap a field to change it:",
+        parse_mode="HTML",
+        reply_markup=_meta_edit_kb(meta),
+    )
+    return META_EDIT_PICK
+
+
+async def meta_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped a field — ask for the new value (buttons for option fields)."""
+    query = update.callback_query
+    await query.answer()
+    key = query.data.split(":", 1)[1]
+    if key == "back":
+        inspection_id = await _resolve_inspection_id(query, context)
+        return await _show_zone_picker(query, context, inspection_id)
+
+    field = next((f for f in META_FIELDS if f[1] == key), None)
+    if not field:
+        return META_EDIT_PICK
+    _, _, _, prompt, options = field
+    context.user_data["_meta_edit_key"] = key
+    cur = context.user_data.get("_meta", {}).get(key, "—")
+
+    if options:
+        await query.edit_message_text(
+            f"✏️ <b>{prompt.split(chr(10))[0]}</b>\nCurrent: {cur}\n\nPick a new value:",
+            parse_mode="HTML",
+            reply_markup=inline_kb(options, "metaval"),
+        )
+    else:
+        await query.edit_message_text(
+            f"✏️ <b>{prompt.split(chr(10))[0]}</b>\nCurrent: {cur}\n\nType the new value:",
+            parse_mode="HTML",
+        )
+    return META_EDIT_VALUE
+
+
+async def _meta_edit_save(context, value: str) -> dict:
+    """Persist the edited field and return the updated meta."""
+    key = context.user_data.get("_meta_edit_key")
+    inspection_id = context.user_data.get("_inspection_id")
+    meta = dict(context.user_data.get("_meta") or {})
+    meta[key] = value
+    update_inspection(inspection_id, meta=meta)
+    context.user_data["_meta"] = meta
+    context.user_data.pop("_meta_edit_key", None)
+    return meta
+
+
+async def meta_edit_value_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    meta = await _meta_edit_save(context, update.message.text.strip())
+    await update.message.reply_text(
+        "✅ Saved.\n\n✏️ <b>Edit inspection details</b>\n\nTap a field to change it:",
+        parse_mode="HTML",
+        reply_markup=_meta_edit_kb(meta),
+    )
+    return META_EDIT_PICK
+
+
+async def meta_edit_value_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    meta = await _meta_edit_save(context, query.data.split(":", 1)[1])
+    await query.edit_message_text(
+        "✅ Saved.\n\n✏️ <b>Edit inspection details</b>\n\nTap a field to change it:",
+        parse_mode="HTML",
+        reply_markup=_meta_edit_kb(meta),
+    )
+    return META_EDIT_PICK
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v4.4 ZONE MANAGEMENT — add / rename / delete zones mid-inspection
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def zone_mgmt_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    inspection_id = await _resolve_inspection_id(query, context)
+    if not inspection_id:
+        await query.edit_message_text("⚠️ Session expired. Tap /start to continue.")
+        return ConversationHandler.END
+    zones = get_zones(inspection_id)
+    zone_list = "\n".join(
+        f"  {z['zone_number']}. {z['name']} "
+        f"({len(z.get('defects') or [])} defects)" for z in zones
+    ) or "  (no zones)"
+    await query.edit_message_text(
+        f"⚙️ <b>Manage zones</b>\n\n{zone_list}\n\nWhat do you want to do?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add zone", callback_data="zmgmt:add")],
+            [InlineKeyboardButton("✏️ Rename zone", callback_data="zmgmt:rename")],
+            [InlineKeyboardButton("🗑 Delete zone", callback_data="zmgmt:delete")],
+            [InlineKeyboardButton("◀️ Back to zones", callback_data="zmgmt:back")],
+        ]),
+    )
+    return ZONE_MGMT_MENU
+
+
+async def zone_mgmt_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    inspection_id = await _resolve_inspection_id(query, context)
+
+    if action == "back":
+        return await _show_zone_picker(query, context, inspection_id)
+
+    if action == "menu":
+        return await zone_mgmt_menu(update, context)
+
+    if action == "add":
+        await query.edit_message_text(
+            "➕ <b>Add zone</b>\n\nEnter the name of the new zone\n(e.g. Balcony, Laundry, Storage):",
+            parse_mode="HTML",
+        )
+        return ZONE_ADD_NAME
+
+    zones = get_zones(inspection_id)
+    if not zones:
+        await query.edit_message_text("No zones to modify.", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ Back", callback_data="zmgmt:menu")]]))
+        return ZONE_MGMT_MENU
+
+    if action == "rename":
+        buttons = [[InlineKeyboardButton(f"{z['zone_number']}. {z['name']}", callback_data=f"zren:{z['id']}")] for z in zones]
+        buttons.append([InlineKeyboardButton("◀️ Back", callback_data="zmgmt:menu")])
+        await query.edit_message_text("✏️ <b>Rename zone</b>\n\nWhich zone?", parse_mode="HTML",
+                                      reply_markup=InlineKeyboardMarkup(buttons))
+        return ZONE_RENAME_PICK
+
+    if action == "delete":
+        buttons = [[InlineKeyboardButton(
+            f"{z['zone_number']}. {z['name']} ({len(z.get('defects') or [])} defects)",
+            callback_data=f"zdel:{z['id']}")] for z in zones]
+        buttons.append([InlineKeyboardButton("◀️ Back", callback_data="zmgmt:menu")])
+        await query.edit_message_text("🗑 <b>Delete zone</b>\n\nWhich zone?", parse_mode="HTML",
+                                      reply_markup=InlineKeyboardMarkup(buttons))
+        return ZONE_DELETE_PICK
+
+    return ZONE_MGMT_MENU
+
+
+# ── Add ──
+async def zone_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """v4.5: name only — zone is created immediately as 'regular' (MEP selection removed)."""
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Please enter a zone name:")
+        return ZONE_ADD_NAME
+    inspection_id = context.user_data.get("_inspection_id")
+    if not inspection_id:
+        insp = get_user_active_inspection(str(update.effective_user.id))
+        if insp:
+            inspection_id = insp["id"]
+            context.user_data["_inspection_id"] = inspection_id
+        else:
+            await update.message.reply_text("⚠️ Session expired. Tap /start to continue.")
+            return ConversationHandler.END
+    zones = get_zones(inspection_id)
+    next_num = (max((z["zone_number"] for z in zones), default=0)) + 1
+    add_zone(inspection_id, next_num, name, "regular")
+    await update.message.reply_text(
+        f"✅ Zone <b>{next_num}. {name}</b> added.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Manage zones", callback_data="zmgmt:menu")],
+            [InlineKeyboardButton("◀️ Back to zones", callback_data="zmgmt:back")],
+        ]),
+    )
+    return ZONE_MGMT_MENU
+
+
+async def zone_add_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Legacy (v4.5: type selection removed). Resolves a stale zaddtype: tap as 'regular'."""
+    query = update.callback_query
+    await query.answer()
+    name = context.user_data.pop("_zone_add_name", None)
+    inspection_id = await _resolve_inspection_id(query, context)
+    if name and inspection_id:
+        zones = get_zones(inspection_id)
+        next_num = (max((z["zone_number"] for z in zones), default=0)) + 1
+        add_zone(inspection_id, next_num, name, "regular")
+        msg = f"✅ Zone <b>{next_num}. {name}</b> added."
+    else:
+        msg = "⚙️ Manage zones"
+    await query.edit_message_text(
+        msg, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Manage zones", callback_data="zmgmt:menu")],
+            [InlineKeyboardButton("◀️ Back to zones", callback_data="zmgmt:back")],
+        ]),
+    )
+    return ZONE_MGMT_MENU
+
+
+# ── Rename ──
+async def zone_rename_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    zone_id = query.data.split(":", 1)[1]
+    zone = get_zone_by_id(zone_id)
+    if not zone:
+        return await zone_mgmt_menu(update, context)
+    context.user_data["_zone_rename_id"] = zone_id
+    await query.edit_message_text(
+        f"✏️ Renaming <b>{zone['zone_number']}. {zone['name']}</b>\n\nEnter the new name:",
+        parse_mode="HTML",
+    )
+    return ZONE_RENAME_VALUE
+
+
+async def zone_rename_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    new_name = update.message.text.strip()
+    zone_id = context.user_data.pop("_zone_rename_id", None)
+    if not zone_id or not new_name:
+        await update.message.reply_text("Please enter a valid name:")
+        return ZONE_RENAME_VALUE
+    update_zone(zone_id, name=new_name)
+    await update.message.reply_text(
+        f"✅ Zone renamed to <b>{new_name}</b>.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Manage zones", callback_data="zmgmt:menu")],
+            [InlineKeyboardButton("◀️ Back to zones", callback_data="zmgmt:back")],
+        ]),
+    )
+    return ZONE_MGMT_MENU
+
+
+# ── Delete ──
+async def zone_delete_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    zone_id = query.data.split(":", 1)[1]
+    zone = get_zone_by_id(zone_id)
+    if not zone:
+        return await zone_mgmt_menu(update, context)
+    context.user_data["_zone_delete_id"] = zone_id
+    n = len(zone.get("defects") or [])
+    warn = f"\n\n⚠️ This zone has <b>{n} defects</b> — they will be permanently deleted." if n else ""
+    await query.edit_message_text(
+        f"🗑 Delete <b>{zone['zone_number']}. {zone['name']}</b>?{warn}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Yes, delete", callback_data="zdelconf:yes"),
+             InlineKeyboardButton("❌ Cancel", callback_data="zdelconf:no")],
+        ]),
+    )
+    return ZONE_DELETE_CONFIRM
+
+
+async def zone_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    zone_id = context.user_data.pop("_zone_delete_id", None)
+    inspection_id = await _resolve_inspection_id(query, context)
+    if choice == "yes" and zone_id:
+        zone = get_zone_by_id(zone_id)
+        name = zone["name"] if zone else "zone"
+        delete_zone(zone_id)
+        renumber_zones(inspection_id)
+        # If the deleted zone was the one currently selected, clear it
+        if context.user_data.get("_current_zone_id") == zone_id:
+            context.user_data.pop("_current_zone_id", None)
+        msg = f"✅ Zone <b>{name}</b> deleted. Zones renumbered."
+    else:
+        msg = "❌ Delete cancelled."
+    await query.edit_message_text(
+        msg, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Manage zones", callback_data="zmgmt:menu")],
+            [InlineKeyboardButton("◀️ Back to zones", callback_data="zmgmt:back")],
+        ]),
+    )
+    return ZONE_MGMT_MENU
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v4.4 FINISH CONFIRMATION — guard against accidental finish
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def finish_confirm_prompt(query, context) -> int:
+    """Ask for explicit confirmation before generating the PDF."""
+    inspection_id = await _resolve_inspection_id(query, context)
+    zones = get_zones(inspection_id) if inspection_id else []
+    total = sum(len(z.get("defects") or []) for z in zones)
+    pending = sum(1 for z in zones if z["status"] != "done")
+    pending_line = f"\n⚠️ {pending} zone(s) not marked done yet." if pending else ""
+    await query.edit_message_text(
+        f"🏁 <b>Finish inspection?</b>\n\n"
+        f"📋 {len(zones)} zones · {total} defects{pending_line}\n\n"
+        f"This will generate the PDF and close the inspection.\n"
+        f"You can still resume later if needed.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, finish & generate PDF", callback_data="finishconf:yes")],
+            [InlineKeyboardButton("◀️ No, keep inspecting", callback_data="finishconf:no")],
+        ]),
+    )
+    return FINISH_CONFIRM
+
+
+async def finish_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    if choice == "yes":
+        return await _try_finish(query, context)
+    inspection_id = await _resolve_inspection_id(query, context)
+    return await _show_zone_picker(query, context, inspection_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2143,10 +2728,19 @@ def build_app():
             # Join
             JOIN_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, join_code_handler)],
 
+            # v4.4 De-snagging
+            DESNAG_UNIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, desnag_unit_handler),
+                CallbackQueryHandler(desnag_pick_handler, pattern=r"^desnag:"),
+            ],
+
             # Zone picking
             PICK_ZONE: [
                 CallbackQueryHandler(zone_pick_handler, pattern=r"^zone:"),
                 CallbackQueryHandler(_begin_zone_pick, pattern=r"^zones:start$"),
+                CallbackQueryHandler(meta_edit_menu, pattern=r"^meta:edit$"),       # v4.4
+                CallbackQueryHandler(zone_mgmt_action, pattern=r"^zmgmt:"),        # v4.4
+                CallbackQueryHandler(finish_confirm_handler, pattern=r"^finishconf:"),  # v4.4
             ],
 
             # Defect flow (v4: no per-defect AI — photo → severity → description)
@@ -2194,6 +2788,46 @@ def build_app():
             ],
             EDIT_DEFECT_DESC: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_defect_desc_handler),
+            ],
+
+            # v4.4 Meta edit
+            META_EDIT_PICK: [
+                CallbackQueryHandler(meta_edit_pick, pattern=r"^metaedit:"),
+            ],
+            META_EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, meta_edit_value_text),
+                CallbackQueryHandler(meta_edit_value_callback, pattern=r"^metaval:"),
+            ],
+
+            # v4.4 Zone management
+            ZONE_MGMT_MENU: [
+                CallbackQueryHandler(zone_mgmt_action, pattern=r"^zmgmt:"),
+            ],
+            ZONE_ADD_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, zone_add_name),
+                CallbackQueryHandler(zone_mgmt_action, pattern=r"^zmgmt:"),
+            ],
+            ZONE_ADD_TYPE: [
+                CallbackQueryHandler(zone_add_type, pattern=r"^zaddtype:"),
+            ],
+            ZONE_RENAME_PICK: [
+                CallbackQueryHandler(zone_rename_pick, pattern=r"^zren:"),
+                CallbackQueryHandler(zone_mgmt_action, pattern=r"^zmgmt:"),
+            ],
+            ZONE_RENAME_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, zone_rename_value),
+            ],
+            ZONE_DELETE_PICK: [
+                CallbackQueryHandler(zone_delete_pick, pattern=r"^zdel:"),
+                CallbackQueryHandler(zone_mgmt_action, pattern=r"^zmgmt:"),
+            ],
+            ZONE_DELETE_CONFIRM: [
+                CallbackQueryHandler(zone_delete_confirm, pattern=r"^zdelconf:"),
+            ],
+
+            # v4.4 Finish confirmation
+            FINISH_CONFIRM: [
+                CallbackQueryHandler(finish_confirm_handler, pattern=r"^finishconf:"),
             ],
         },
         fallbacks=[
