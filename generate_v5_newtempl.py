@@ -87,11 +87,10 @@ def photo_crop(src_path, tmp_path, tw, th):
         nw, nh = int(iw*scale)+1, int(ih*scale)+1
         img = img.resize((nw, nh), Image.LANCZOS)
         ox, oy = (nw-tw)//2, (nh-th)//2
-        # x3 resolution (528x501 px) + quality=85 + optimize. The card renders at only
-        # ~176pt wide, so x3 already gives ~2.2x print density — crisp. x4 was oversampling
-        # (704px into a 235px slot): it doubled file size for pixels the eye can't see.
-        # This halves per-photo weight (~110KB vs ~234KB) with no visible quality loss.
-        img.crop((ox, oy, ox+tw, oy+th)).save(tmp_path, "JPEG", quality=85, optimize=True)
+        # x3.5 resolution (616x584 px) + quality=88 + optimize.
+        # Calibrated on production data: 373 photos → ~24 MB, 500 photos → ~32 MB
+        # (targets: ≤25 MB for a standard inspection, 30–35 MB for 500 photos).
+        img.crop((ox, oy, ox+tw, oy+th)).save(tmp_path, "JPEG", quality=88, optimize=True)
         return True
     except:
         return False
@@ -316,7 +315,7 @@ def defect_card(c, fx, fy, sev, desc, photo=None):
     c.rect(fx, photo_rl, CW, PHOTO_H, stroke=0, fill=1)
     if photo and os.path.exists(photo):
         tmp = f"/tmp/c_{fx}_{abs(int(fy))}.jpg"
-        if photo_crop(photo, tmp, int(CW*3), int(PHOTO_H*3)):
+        if photo_crop(photo, tmp, int(CW*3.5), int(PHOTO_H*3.5)):
             c.drawImage(ImageReader(tmp), fx, photo_rl, CW, PHOTO_H)
         else:
             c.setFont("Lex-Light", 8)
