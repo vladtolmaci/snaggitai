@@ -40,6 +40,11 @@ SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
 REPORT_DIR     = os.environ.get("REPORT_DIR", "/app/data")
 ASSETS_DIR     = os.environ.get("ASSETS_DIR", REPORT_DIR)
+# v4.6: Reports/backups go to a DEDICATED bucket. The original "inspection-photos" bucket
+# only allows image/* MIME types and caps files at 5 MB, so every PDF/JSON upload to it
+# was silently rejected (reports: 0, backups: 0 in prod). Bucket "inspection-reports"
+# allows application/pdf + application/json with no bucket-level size cap.
+REPORTS_BUCKET = os.environ.get("REPORTS_BUCKET", "inspection-reports")
 
 # ── Supabase client ──────────────────────────────────────────────────────────
 _SUPABASE = None
@@ -222,26 +227,30 @@ def renumber_zones(inspection_id: str):
         update_zone(z["id"], zone_number=i)
 
 
-def find_previous_inspections_by_unit(unit: str, limit: int = 5) -> list:
+def find_previous_inspections_by_unit(unit: str, limit: int = 8) -> list:
     """v4.4 De-snagging: find previous COMPLETE inspections matching a unit number.
 
-    Case-insensitive substring match on meta->>'unit', newest first. Returns full rows
-    (meta included) so the caller can reuse the metadata.
+    Matching is case-insensitive and two-tiered so that "504" prefers unit "504" over
+    "1504" / "504A" / "A-504":
+      1. EXACT matches on meta->>'unit' (newest first). If any exist, only these are
+         returned — the inspector sees "504" in Hills Park and "504" in Yas Golf, and
+         picks by project/date.
+      2. Otherwise SUBSTRING matches (newest first), so partial input still works.
 
-    Supabase keeps rows indefinitely (no auto-expiry), so previous inspections are
-    always available for de-snagging unless manually deleted.
+    Returns full rows (meta included). Supabase keeps rows indefinitely (no auto-expiry),
+    so any past unit is available unless manually deleted.
     """
     q = unit.strip()
     if not q:
         return []
-    res = (_sb().table("inspections")
-           .select("*")
-           .ilike("meta->>unit", f"%{q}%")
-           .eq("status", "complete")
-           .order("created_at", desc=True)
-           .limit(limit)
-           .execute())
-    return res.data or []
+    base = _sb().table("inspections").select("*").eq("status", "complete")
+    exact = (base.ilike("meta->>unit", q)          # ilike without wildcards = case-insensitive equality
+             .order("created_at", desc=True).limit(limit).execute().data or [])
+    if exact:
+        return exact
+    return (_sb().table("inspections").select("*").eq("status", "complete")
+            .ilike("meta->>unit", f"%{q}%")
+            .order("created_at", desc=True).limit(limit).execute().data or [])
 
 
 def append_defect_to_zone(zone_id: str, defect: dict):
@@ -330,20 +339,20 @@ def backup_inspection_json(inspection_id: str) -> str | None:
         key = f"backups/{safe_unit}_{inspection_id}.json"
         sb = _sb()
         try:
-            sb.storage.from_("inspection-photos").upload(
+            sb.storage.from_(REPORTS_BUCKET).upload(
                 key, raw,
                 {"content-type": "application/json", "upsert": "true"},
             )
         except Exception:
             # Older supabase-py: upsert via update if it already exists
-            sb.storage.from_("inspection-photos").update(
+            sb.storage.from_(REPORTS_BUCKET).update(
                 key, raw, {"content-type": "application/json"},
             )
-        url = sb.storage.from_("inspection-photos").get_public_url(key)
+        url = sb.storage.from_(REPORTS_BUCKET).get_public_url(key)
         logger.info(f"Backup JSON saved for {inspection_id}: {url}")
         return url
     except Exception as e:
-        logger.error(f"backup_inspection_json failed for {inspection_id}: {e!r}", exc_info=True)
+        logger.error(f"backup_inspection_json failed for {inspection_id} (bucket={REPORTS_BUCKET}): {e!r}", exc_info=True)
         return None
 
 
@@ -360,20 +369,106 @@ def upload_pdf_to_storage(pdf_path: str, inspection_id: str, unit: str) -> str |
         key = f"reports/{safe_unit}_{inspection_id}.pdf"
         sb = _sb()
         try:
-            sb.storage.from_("inspection-photos").upload(
+            sb.storage.from_(REPORTS_BUCKET).upload(
                 key, raw,
                 {"content-type": "application/pdf", "upsert": "true"},
             )
         except Exception:
-            sb.storage.from_("inspection-photos").update(
+            sb.storage.from_(REPORTS_BUCKET).update(
                 key, raw, {"content-type": "application/pdf"},
             )
-        url = sb.storage.from_("inspection-photos").get_public_url(key)
+        url = sb.storage.from_(REPORTS_BUCKET).get_public_url(key)
         logger.info(f"PDF uploaded to storage for {inspection_id}: {url} ({len(raw)} bytes)")
         return url
     except Exception as e:
-        logger.error(f"upload_pdf_to_storage failed for {inspection_id}: {e!r}", exc_info=True)
+        logger.error(f"upload_pdf_to_storage failed for {inspection_id} (bucket={REPORTS_BUCKET}, {os.path.getsize(pdf_path) if os.path.exists(pdf_path) else '?'} bytes): {e!r}", exc_info=True)
         return None
+
+
+
+def split_pdf_by_size(pdf_path: str, max_bytes: int) -> list:
+    """v4.6: Split a PDF into consecutive page-range parts, each under `max_bytes`.
+
+    Needed when a report exceeds both Telegram's 50 MB bot limit and Supabase's
+    50 MB per-file limit (free plan): splitting keeps full photo quality instead of
+    degrading it. Page sizes are measured standalone (slightly over-estimates because
+    shared resources get duplicated per part), so parts land safely under the cap.
+    Returns [pdf_path] unchanged if it already fits.
+    """
+    import io
+    from pypdf import PdfReader, PdfWriter
+    if os.path.getsize(pdf_path) <= max_bytes:
+        return [pdf_path]
+    reader = PdfReader(pdf_path)
+
+    def _page_bytes(page) -> int:
+        """Estimate a page's weight from its content stream + image XObjects (fast —
+        no re-serialisation). Images dominate report pages, so this is accurate enough;
+        a 15% safety margin is applied by the caller via max_bytes."""
+        total = 0
+        try:
+            c = page.get("/Contents")
+            if c is not None:
+                c = c.get_object()
+                items = c if isinstance(c, list) else [c]
+                for it in items:
+                    try: total += len(it.get_object().get_data())
+                    except Exception: pass
+            res = page.get("/Resources")
+            if res is not None:
+                xo = res.get_object().get("/XObject")
+                if xo is not None:
+                    for v in xo.get_object().values():
+                        try:
+                            o = v.get_object()
+                            total += int(o.get("/Length", 0)) or len(o.get_data())
+                        except Exception: pass
+        except Exception:
+            pass
+        return max(total, 20_000)  # never estimate a page as weightless
+
+    sizes = [_page_bytes(p) for p in reader.pages]
+    # Measured sum is below the real file (shared objects, xref, fonts); scale so the
+    # per-page estimates add up to the actual file size.
+    real = os.path.getsize(pdf_path); est = sum(sizes) or 1
+    sizes = [int(s * real / est) for s in sizes]
+    groups, cur, cur_size = [], [], 0
+    for i, s in enumerate(sizes):
+        if cur and cur_size + s > max_bytes:
+            groups.append(cur); cur, cur_size = [], 0
+        cur.append(i); cur_size += s
+    if cur:
+        groups.append(cur)
+    if len(groups) <= 1:
+        return [pdf_path]
+    base, ext = os.path.splitext(pdf_path)
+
+    def _write_group(g: list, tag: str) -> list:
+        """Write pages `g` to one file; if it still exceeds the cap, split in half and recurse."""
+        w = PdfWriter()
+        for i in g:
+            w.add_page(reader.pages[i])
+        path = f"{base}_{tag}{ext}"
+        with open(path, "wb") as f:
+            w.write(f)
+        sz = os.path.getsize(path)
+        if sz > max_bytes and len(g) > 1:
+            os.remove(path)
+            mid = len(g) // 2
+            return _write_group(g[:mid], tag + "a") + _write_group(g[mid:], tag + "b")
+        logger.info(f"split_pdf: {tag} pages {g[0]+1}-{g[-1]+1} → {sz/1048576:.1f} MB")
+        return [path]
+
+    tmp_paths = []
+    for k, g in enumerate(groups, 1):
+        tmp_paths += _write_group(g, f"tmp{k}")
+    # Rename to clean, ordered partNofM names once the final count is known
+    out = []
+    for k, p in enumerate(tmp_paths, 1):
+        final = f"{base}_part{k}of{len(tmp_paths)}{ext}"
+        os.replace(p, final)
+        out.append(final)
+    return out
 
 
 def get_user_active_inspection(user_id: str) -> dict | None:
@@ -905,17 +1000,21 @@ async def desnag_unit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return DESNAG_UNIT
 
-    # If several previous inspections match, offer a short list to pick the right one.
+    # If several previous inspections match, offer a list to pick the right one.
+    # Same unit number can exist in different projects (504 @ Hills Park vs 504 @ Yas Golf),
+    # or the same unit can have been inspected more than once — project + date disambiguate.
     if len(matches) > 1:
         context.user_data["_desnag_candidates"] = {m["id"]: m for m in matches}
         buttons = []
-        for m in matches:
+        for m in matches:  # already newest-first
             mm = m.get("meta") or {}
-            label = f"{mm.get('project', '?')} — {mm.get('unit', '?')} ({mm.get('date', '?')})"
-            buttons.append([InlineKeyboardButton(label[:60], callback_data=f"desnag:pick:{m['id']}")])
+            label = f"🏗 {mm.get('project', '?')} · {mm.get('unit', '?')} · 📅 {mm.get('date', '?')}"
+            buttons.append([InlineKeyboardButton(label[:64], callback_data=f"desnag:pick:{m['id']}")])
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="desnag:cancel")])
         await update.message.reply_text(
-            f"🔍 Found <b>{len(matches)}</b> previous inspections. Which one is it?",
+            f"🔍 Found <b>{len(matches)}</b> previous inspections for <b>{unit_query}</b> (newest first).\n"
+            f"Which one is it?\n\n"
+            f"<i>Not here? Type a more specific unit (e.g. with tower/block) to narrow the search.</i>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -2380,7 +2479,11 @@ async def _try_finish(query, context: ContextTypes.DEFAULT_TYPE) -> int:
     pdf_size = os.path.getsize(pdf_path)
     size_mb = pdf_size / (1024 * 1024)
     logger.info(f"PDF size: {size_mb:.1f} MB")
-    storage_url = upload_pdf_to_storage(pdf_path, inspection_id, meta.get("unit", "report"))
+    # Telegram bot upload limit is 50 MB; Supabase free-plan per-file limit is also 50 MB.
+    # Whole-file Storage upload only makes sense when it fits; bigger reports are split below.
+    TELEGRAM_LIMIT_MB = 48
+    too_big = size_mb >= TELEGRAM_LIMIT_MB
+    storage_url = None if too_big else upload_pdf_to_storage(pdf_path, inspection_id, meta.get("unit", "report"))
 
     # Send PDF to ALL members
     members = get_members(inspection_id)
@@ -2392,36 +2495,77 @@ async def _try_finish(query, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"📸 {photo_count} photos | {len(zones)} zones"
     )
 
-    # Telegram bot upload limit is 50 MB. If the PDF is at/over ~48 MB, skip the
-    # attachment attempt and deliver the Storage link directly.
-    TELEGRAM_LIMIT_MB = 48
-    too_big = size_mb >= TELEGRAM_LIMIT_MB
-
     sent_count = 0
     fail_count = 0
 
     if too_big:
-        logger.warning(f"PDF is {size_mb:.1f} MB (>{TELEGRAM_LIMIT_MB} MB) — delivering via link only")
-        link_text = (
-            f"{summary}\n\n"
-            f"📄 The report is large ({size_mb:.0f} MB) and exceeds Telegram's file limit, "
-            f"so here's a download link:\n{storage_url or '(upload failed — see backup below)'}"
-        )
-        if not storage_url and backup_url:
-            link_text += f"\n\n💾 Data backup: {backup_url}"
+        # ── Large report: split into parts that fit both Telegram (50 MB) and Storage (50 MB)
+        logger.warning(f"PDF is {size_mb:.1f} MB (>{TELEGRAM_LIMIT_MB} MB) — splitting into parts")
+        try:
+            parts = split_pdf_by_size(pdf_path, max_bytes=42 * 1024 * 1024)
+        except Exception as e:
+            logger.error(f"split_pdf_by_size failed: {e!r}", exc_info=True)
+            parts = [pdf_path]
+        n_parts = len(parts)
+        unit = meta.get("unit", "report")
+        # Upload every part → each gets a permanent link (parts are < 50 MB so this works)
+        part_urls = []
+        for k, p in enumerate(parts, 1):
+            part_urls.append(upload_pdf_to_storage(p, inspection_id, f"{unit}_part{k}of{n_parts}"))
+        links_block = "\n".join(f"Part {k}/{n_parts}: {u}" for k, u in enumerate(part_urls, 1) if u)
+
         for member in members:
-            try:
-                await context.bot.send_message(
-                    chat_id=int(member["user_id"]), text=link_text, parse_mode="HTML",
-                )
+            chat_id = int(member["user_id"])
+            member_ok = True
+            for k, p in enumerate(parts, 1):
+                part_mb = os.path.getsize(p) / (1024 * 1024)
+                caption = (f"{summary}\n\n📄 Part {k} of {n_parts} ({part_mb:.0f} MB)"
+                           if n_parts > 1 else summary)
+                delivered = False
+                for attempt in range(3):
+                    try:
+                        with open(p, "rb") as fh:
+                            await context.bot.send_document(
+                                chat_id=chat_id, document=fh, filename=os.path.basename(p),
+                                caption=caption, parse_mode="HTML",
+                                read_timeout=180, write_timeout=180, connect_timeout=30,
+                            )
+                        delivered = True
+                        logger.info(f"Part {k}/{n_parts} sent to {chat_id}")
+                        break
+                    except Exception as e:
+                        logger.warning(f"Part {k}/{n_parts} send attempt {attempt+1} to {chat_id} failed: {e}")
+                        if attempt < 2:
+                            await asyncio.sleep(2)
+                if not delivered:
+                    member_ok = False
+                    url = part_urls[k - 1]
+                    if url:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=chat_id, parse_mode="HTML",
+                                text=f"📄 Part {k}/{n_parts} couldn't be sent directly. Download it here:\n{url}",
+                            )
+                        except Exception as e:
+                            logger.error(f"Part {k} link fallback to {chat_id} failed: {e}")
+            if member_ok:
                 sent_count += 1
-            except Exception as e:
-                logger.error(f"Link delivery to {member['user_id']} failed: {e}")
+            else:
                 fail_count += 1
+
+        tail = f"\n🔗 Download links:\n{links_block}" if links_block else ""
+        if not links_block:
+            tail = ("\n⚠️ Storage upload failed for the parts — check the Railway logs "
+                    f"(bucket '{REPORTS_BUCKET}' must allow application/pdf).")
+            if backup_url:
+                tail += f"\n💾 Data backup: {backup_url}"
         await query.message.reply_text(
-            f"📄 Report too large for direct send ({size_mb:.0f} MB).\n"
-            f"Download link sent to {sent_count}/{len(members)} member(s).\n"
-            f"🔗 {storage_url or backup_url or 'see logs'}",
+            f"{summary}\n\n"
+            f"📄 Report is {size_mb:.0f} MB — delivered as <b>{n_parts} part(s)</b> to "
+            f"{sent_count}/{len(members)} member(s)."
+            f"{' ❌ ' + str(fail_count) + ' failed (links sent instead).' if fail_count else ''}"
+            f"{tail}",
+            parse_mode="HTML",
         )
         return ConversationHandler.END
 
